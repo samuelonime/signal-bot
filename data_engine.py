@@ -1,6 +1,6 @@
 """
 Data Engine — fetches OHLC candlestick data and stores in PostgreSQL.
-Supports EURUSD, GBPUSD, XAUUSD across M1, M5, M15 timeframes.
+Supports EURUSD, GBPUSD, XAUUSD, USDJPY, BTCUSD across M1, M5, M15 timeframes.
 """
 
 import os
@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-ASSETS = ["EURUSD", "GBPUSD", "XAUUSD"]
+ASSETS = ["EURUSD", "GBPUSD", "XAUUSD", "USDJPY", "BTCUSD"]
 TIMEFRAMES = ["M1", "M5", "M15"]
 
 TF_MINUTES = {"M1": 1, "M5": 5, "M15": 15}
@@ -98,11 +98,13 @@ def _fetch_twelve_data(asset: str, timeframe: str, api_key: str) -> pd.DataFrame
     TD_INTERVAL = {"M1": "1min", "M5": "5min", "M15": "15min"}
     interval = TD_INTERVAL[timeframe]
     
-    # Twelve Data expects format like "EUR/USD" or "XAU/USD"
+    # Twelve Data expects format like "EUR/USD", "XAU/USD", or "BTC/USD"
     if asset == "XAUUSD":
         symbol = "XAU/USD"
+    elif asset == "BTCUSD":
+        symbol = "BTC/USD"
     else:
-        # EURUSD -> EUR/USD
+        # EURUSD -> EUR/USD, GBPUSD -> GBP/USD, USDJPY -> USD/JPY
         symbol = f"{asset[:3]}/{asset[3:]}"
     
     url = (
@@ -147,9 +149,21 @@ def _synthetic_ohlc(asset: str, timeframe: str, n_candles: int = 200) -> pd.Data
     seed = abs(hash(asset + timeframe)) % (2**31)
     rng  = np.random.default_rng(seed)
 
-    base_prices = {"EURUSD": 1.0850, "GBPUSD": 1.2700, "XAUUSD": 2350.0}
+    base_prices = {
+        "EURUSD": 1.0850, 
+        "GBPUSD": 1.2700, 
+        "XAUUSD": 2350.0,
+        "USDJPY": 150.0,
+        "BTCUSD": 65000.0,
+    }
     base = base_prices.get(asset, 1.0)
-    sigma = {"EURUSD": 0.0003, "GBPUSD": 0.0004, "XAUUSD": 0.8}[asset]
+    sigma = {
+        "EURUSD": 0.0003, 
+        "GBPUSD": 0.0004, 
+        "XAUUSD": 0.8,
+        "USDJPY": 0.05,
+        "BTCUSD": 500.0,
+    }[asset]
 
     minutes = TF_MINUTES[timeframe]
     now     = datetime.utcnow().replace(second=0, microsecond=0)
