@@ -1,11 +1,11 @@
 """
 Signal Engine — Orchestrates all modules.
 A signal is only emitted when ALL conditions are satisfied:
-  1. Structure confirmed
-  2. Indicators aligned
-  3. Price action pattern present
-  4. AI confidence > 80
-  5. All filters passed
+  1. Filters pass (session, news, volatility)
+  2. Market structure confirmed
+  3. Price action pattern detected
+  4. Direction resolved (votes decisive)
+  5. AI confidence > 80%
 """
 
 import logging
@@ -23,11 +23,10 @@ from filter_engine import apply_filters, get_current_session
 
 logger = logging.getLogger(__name__)
 
-# Maximum signals per day per asset (anti-overtrade)
 MAX_DAILY_SIGNALS = 20
 
 # ---------------------------------------------------------------------------
-# Signal data class
+# Signal dataclass
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -35,17 +34,17 @@ class Signal:
     timestamp:   datetime
     asset:       str
     timeframe:   str
-    direction:   str          # "CALL" | "PUT"
+    direction:   str
     entry_price: float
     expiry_min:  int
-    confidence:  float        # 0–100
-    reasons:     List[str]    = field(default_factory=list)
-    warnings:    List[str]    = field(default_factory=list)
-    session:     str          = ""
-    prob_up:     float        = 0.0
-    prob_down:   float        = 0.0
-    model_mode:  str          = ""
-    is_valid:    bool         = True
+    confidence:  float
+    reasons:     List[str] = field(default_factory=list)
+    warnings:    List[str] = field(default_factory=list)
+    session:     str       = ""
+    prob_up:     float     = 0.0
+    prob_down:   float     = 0.0
+    model_mode:  str       = ""
+    is_valid:    bool      = True
 
     def to_dict(self) -> dict:
         return {
@@ -64,13 +63,10 @@ class Signal:
         }
 
     def format_message(self, vip: bool = False) -> str:
-        """Format Telegram-ready message."""
         star = "⭐ VIP" if vip else "🔔 Signal"
         bar  = "🟢" if self.direction == "CALL" else "🔴"
-
         reasons_text = "\n".join(f"  ✅ {r}" for r in self.reasons)
         warn_text    = ("\n" + "\n".join(f"  ⚠️ {w}" for w in self.warnings)) if self.warnings else ""
-
         msg = f"""
 {star} | {bar} {self.direction}
 
@@ -89,17 +85,16 @@ class Signal:
 """
         if not vip:
             msg += "\n🔒 Full analysis in VIP channel. Join: t.me/your_vip_channel"
-
         return msg.strip()
 
 
 # ---------------------------------------------------------------------------
-# Daily signal counter (in-memory, reset at midnight)
+# Daily counter
 # ---------------------------------------------------------------------------
 
 _daily_counts: dict = {}
-_last_signal_bar: dict = {}   # asset -> last bar index a signal was sent
-SIGNAL_COOLDOWN_BARS = 3       # min bars between same-asset signals
+_last_signal_bar: dict = {}
+SIGNAL_COOLDOWN_BARS = 3
 
 def _daily_count_key(asset: str, dt: datetime) -> str:
     return f"{asset}:{dt.strftime('%Y-%m-%d')}"
@@ -115,7 +110,7 @@ def _get_count(asset: str, dt: datetime) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Core signal generation
+# Core signal generation — with per-gate INFO logging
 # ---------------------------------------------------------------------------
 
 def generate_signal(
@@ -125,18 +120,16 @@ def generate_signal(
     dt: Optional[datetime] = None,
     spread_pct: float = 0.0,
 ) -> Optional[Signal]:
-    """
-    Run the full signal pipeline for one asset/timeframe pair.
-    Returns a Signal if all conditions are met, else None.
-    """
+
     dt = dt or datetime.utcnow()
+    tag = f"{asset}/{timeframe}"
 
     # --- Daily cap
     if _get_count(asset, dt) >= MAX_DAILY_SIGNALS:
-        logger.debug(f"{asset}: daily signal cap reached.")
+        logger.info(f"⛔ {tag}: daily cap reached ({MAX_DAILY_SIGNALS})")
         return None
 
-    # --- Data
+    # --- Load data
     if df is None or len(df) < 50:
         try:
             df = load_ohlc(asset, timeframe, limit=300)
@@ -144,52 +137,86 @@ def generate_signal(
                 df = fetch_ohlc(asset, timeframe, n_candles=300)
                 store_ohlc(asset, timeframe, df)
         except Exception as exc:
-            logger.warning(f"Data fetch failed for {asset}/{timeframe}: {exc}")
+            logger.warning(f"⛔ {tag}: data fetch failed — {exc}")
             return None
 
     if len(df) < 50:
+        logger.info(f"⛔ {tag}: insufficient data ({len(df)} candles)")
         return None
 
     entry_price = float(df["close"].iloc[-1])
 
-    # ---- 1. Filters (session, news, volatility, trend) ----
+    # ---- Gate 1: Indicators (needed for filter) ----
     ind = compute_indicators(df)
 
+    # ---- Gate 2: Filters ----
     filt = apply_filters(
         asset=asset,
         timeframe=timeframe,
         atr_pct=ind.atr_pct,
         volatility_state=ind.volatility_state,
-        trend=ind.ema_trend,       # Quick pre-check
+        trend=ind.ema_trend,
         dt=dt,
         spread_pct=spread_pct,
     )
-
     if not filt.allowed:
-        logger.debug(f"{asset}/{timeframe} blocked by filter: {filt.reasons}")
+        logger.info(f"⛔ {tag}: FILTER blocked — {filt.reasons[0] if filt.reasons else '?'}")
         return None
 
-    # ---- 2. Market structure ----
+    # ---- Gate 3: Market structure ----
     struct = analyse_structure(df)
 
+    logger.info(
+        f"🔍 {tag}: trend={struct.trend}({struct.trend_strength:.0%}) "
+        f"valid={struct.structure_valid} | "
+        f"at_sup={struct.at_support} at_res={struct.at_resistance} "
+        f"pullback={struct.pullback} fakeout={struct.fakeout}"
+    )
+
     if not struct.structure_valid:
-        logger.debug(f"{asset}/{timeframe}: structure invalid (trend={struct.trend}, strength={struct.trend_strength})")
+        logger.info(
+            f"⛔ {tag}: STRUCTURE blocked — "
+            f"trend={struct.trend} strength={struct.trend_strength:.0%} "
+            f"at_level={struct.at_support or struct.at_resistance or struct.pullback} "
+            f"fakeout={struct.fakeout}"
+        )
         return None
 
-    # ---- 3. Price action ----
+    # ---- Gate 4: Indicators detail ----
+    logger.info(
+        f"📊 {tag}: EMA={ind.ema_trend}(spread={ind.ema_spread_pct:.3f}%) "
+        f"RSI={ind.rsi:.1f}[{ind.rsi_zone}] "
+        f"MACD_cross={ind.macd_cross} MACD_hist={ind.macd_hist:.6f} "
+        f"ATR%={ind.atr_pct:.4f} vol={ind.volatility_state}"
+    )
+
+    # ---- Gate 5: Price action ----
     pa = analyse_price_action(df)
+    logger.info(
+        f"🕯️  {tag}: PA patterns={pa.pattern_names} "
+        f"bull={pa.bullish_bias:.2f} bear={pa.bearish_bias:.2f}"
+    )
 
     if pa.dominant_pattern is None:
-        logger.debug(f"{asset}/{timeframe}: no price action pattern detected")
+        logger.info(f"⛔ {tag}: PA blocked — no directional candle pattern detected")
         return None
 
-    # ---- 4. Determine candidate direction ----
-    direction = _resolve_direction(struct, ind, pa)
+    # ---- Gate 6: Direction vote ----
+    direction, votes = _resolve_direction_verbose(struct, ind, pa)
+    logger.info(
+        f"🗳️  {tag}: votes CALL={votes['CALL']} PUT={votes['PUT']} → direction={direction}"
+    )
+
     if direction is None:
-        logger.debug(f"{asset}/{timeframe}: conflicting signals, no clear direction")
+        total = votes["CALL"] + votes["PUT"]
+        ratio = max(votes["CALL"], votes["PUT"]) / total if total > 0 else 0
+        logger.info(
+            f"⛔ {tag}: DIRECTION blocked — no decisive majority "
+            f"(best={ratio:.0%}, need 65%)"
+        )
         return None
 
-    # ---- 5. AI confidence ----
+    # ---- Gate 7: AI confidence ----
     features = build_features(
         rsi=ind.rsi,
         macd_hist=ind.macd_hist,
@@ -211,28 +238,34 @@ def generate_signal(
     )
 
     ai_score = get_ai_engine().score(features)
+    logger.info(
+        f"🤖 {tag}: AI dir={ai_score.direction} conf={ai_score.confidence:.1f}% "
+        f"P(UP)={ai_score.prob_up:.2f} P(DN)={ai_score.prob_down:.2f} "
+        f"threshold={CONFIDENCE_THRESHOLD}% passes={ai_score.passes_threshold}"
+    )
 
-    # Enforce direction consistency: AI direction must match our structural direction
+    # Direction consistency check
     if ai_score.direction != direction:
-        # If AI disagrees, require higher raw probability to override
         matching_prob = ai_score.prob_up if direction == "CALL" else ai_score.prob_down
+        logger.info(
+            f"⚠️  {tag}: AI direction conflict "
+            f"(AI={ai_score.direction} struct={direction}) "
+            f"matching_prob={matching_prob:.2f}"
+        )
         if matching_prob < 0.60:
-            logger.debug(f"{asset}/{timeframe}: AI direction conflict (AI={ai_score.direction}, struct={direction})")
+            logger.info(f"⛔ {tag}: AI CONFLICT blocked — matching_prob {matching_prob:.2f} < 0.60")
             return None
-        # AI disagrees but structural probability is acceptable — keep structural direction but note it
-        logger.debug(f"{asset}/{timeframe}: AI soft conflict, proceeding with structural direction")
 
     if not ai_score.passes_threshold:
-        logger.debug(
-            f"{asset}/{timeframe}: AI confidence {ai_score.confidence:.1f}% < {CONFIDENCE_THRESHOLD}%"
+        logger.info(
+            f"⛔ {tag}: AI CONFIDENCE blocked — "
+            f"{ai_score.confidence:.1f}% < {CONFIDENCE_THRESHOLD}%"
         )
         return None
 
-    # ---- 6. Build reasons ----
+    # ---- All gates passed — emit signal ----
     reasons = _build_reasons(direction, struct, ind, pa, ai_score, dt)
-
-    # ---- 7. Assemble signal ----
-    expiry = TF_EXPIRY[timeframe]
+    expiry  = TF_EXPIRY[timeframe]
     session = get_current_session(dt)
 
     signal = Signal(
@@ -253,19 +286,21 @@ def generate_signal(
 
     _increment_count(asset, dt)
     logger.info(
-        f"✅ SIGNAL: {asset}/{timeframe} {direction} | conf={ai_score.confidence:.1f}% | {entry_price:.5f}"
+        f"✅ SIGNAL EMITTED: {asset}/{timeframe} {direction} "
+        f"conf={ai_score.confidence:.1f}% entry={entry_price:.5f}"
     )
     return signal
 
 
 # ---------------------------------------------------------------------------
-# Scan all assets and timeframes
+# Scan all
 # ---------------------------------------------------------------------------
 
 def scan_all(dt: Optional[datetime] = None, spread_pcts: dict = {}) -> List[Signal]:
-    """Scan every asset/timeframe combination and return valid signals."""
     signals = []
     dt      = dt or datetime.utcnow()
+
+    logger.info(f"━━━ Scan started {dt.strftime('%H:%M:%S UTC')} ━━━")
 
     for asset in ASSETS:
         for tf in TIMEFRAMES:
@@ -275,9 +310,9 @@ def scan_all(dt: Optional[datetime] = None, spread_pcts: dict = {}) -> List[Sign
                 if sig:
                     signals.append(sig)
             except Exception as exc:
-                logger.error(f"Scan error {asset}/{tf}: {exc}")
+                logger.error(f"Scan error {asset}/{tf}: {exc}", exc_info=True)
 
-    logger.info(f"Scan complete — {len(signals)} signal(s) generated.")
+    logger.info(f"━━━ Scan complete — {len(signals)} signal(s) ━━━")
     return signals
 
 
@@ -285,18 +320,15 @@ def scan_all(dt: Optional[datetime] = None, spread_pcts: dict = {}) -> List[Sign
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _resolve_direction(
+def _resolve_direction_verbose(
     struct: StructureResult,
     ind: IndicatorResult,
     pa: PriceActionResult,
-) -> Optional[str]:
-    """
-    Resolve the signal direction from structure + indicator + price action.
-    All three must agree on direction; conflicting signals are discarded.
-    """
+) -> Tuple[Optional[str], dict]:
+    """Returns (direction, votes_dict) for logging."""
     votes = {"CALL": 0, "PUT": 0}
 
-    # Structure vote
+    # Structure votes
     if struct.trend == "bullish" and (struct.at_support or struct.pullback):
         votes["CALL"] += 3
     elif struct.trend == "bearish" and (struct.at_resistance or struct.pullback):
@@ -307,7 +339,7 @@ def _resolve_direction(
     elif struct.breakout == "bearish_break":
         votes["PUT"]  += 2
 
-    # Indicator vote
+    # Indicator votes
     if ind.ema_trend == "bullish":
         votes["CALL"] += 2
     elif ind.ema_trend == "bearish":
@@ -323,43 +355,40 @@ def _resolve_direction(
     elif ind.macd_cross == "bearish":
         votes["PUT"]  += 2
 
-    # Price action vote
+    # Price action votes
     if pa.dominant_pattern:
         if pa.dominant_pattern.direction == "bullish":
             votes["CALL"] += int(pa.dominant_pattern.strength * 3)
         elif pa.dominant_pattern.direction == "bearish":
             votes["PUT"]  += int(pa.dominant_pattern.strength * 3)
 
-    # Require decisive majority (60%+ of votes)
     total = votes["CALL"] + votes["PUT"]
     if total == 0:
-        return None
+        return None, votes
 
     if votes["CALL"] / total >= 0.65:
-        return "CALL"
+        return "CALL", votes
     elif votes["PUT"] / total >= 0.65:
-        return "PUT"
+        return "PUT", votes
 
-    return None   # Conflicting
+    return None, votes
 
 
-def _build_reasons(
-    direction: str,
-    struct: StructureResult,
-    ind: IndicatorResult,
-    pa: PriceActionResult,
-    ai: AIScore,
-    dt: datetime,
-) -> List[str]:
+# Keep old name for backtester compatibility
+def _resolve_direction(struct, ind, pa):
+    direction, _ = _resolve_direction_verbose(struct, ind, pa)
+    return direction
+
+
+def _build_reasons(direction, struct, ind, pa, ai, dt) -> List[str]:
     reasons = []
 
-    # Trend
     reasons.append(
         f"{'Uptrend' if struct.trend == 'bullish' else 'Downtrend'} confirmed "
-        f"(EMA 50 {'>' if struct.trend == 'bullish' else '<'} EMA 200, strength={struct.trend_strength:.0%})"
+        f"(EMA 50 {'>' if struct.trend == 'bullish' else '<'} EMA 200, "
+        f"strength={struct.trend_strength:.0%})"
     )
 
-    # Structure
     if struct.at_support and direction == "CALL":
         reasons.append(f"Price at key support zone ({struct.nearest_support:.5f})")
     if struct.at_resistance and direction == "PUT":
@@ -369,11 +398,9 @@ def _build_reasons(
     if struct.breakout:
         reasons.append(f"Structural breakout: {struct.breakout.replace('_', ' ').title()}")
 
-    # Price action
     if pa.dominant_pattern:
         reasons.append(f"{pa.dominant_pattern.name} — {pa.dominant_pattern.description}")
 
-    # Indicators
     if ind.rsi_zone == "oversold" and direction == "CALL":
         reasons.append(f"RSI({ind.rsi:.1f}) recovering from oversold zone")
     elif ind.rsi_zone == "overbought" and direction == "PUT":
@@ -388,14 +415,12 @@ def _build_reasons(
     elif ind.macd_hist < 0 and direction == "PUT":
         reasons.append("MACD histogram negative — bearish momentum building")
 
-    # AI
     reasons.append(
-        f"AI confidence: {ai.confidence:.0f}% ({'ML' if ai.model_mode == 'ml' else 'Heuristic'} model | "
-        f"P(UP)={ai.prob_up:.1%}, P(DN)={ai.prob_down:.1%})"
+        f"AI confidence: {ai.confidence:.0f}% "
+        f"({'ML' if ai.model_mode == 'ml' else 'Heuristic'} | "
+        f"P(UP)={ai.prob_up:.1%} P(DN)={ai.prob_down:.1%})"
     )
 
-    # Session
-    session = get_current_session(dt)
-    reasons.append(f"Trading in: {session}")
+    reasons.append(f"Session: {get_current_session(dt)}")
 
     return reasons
