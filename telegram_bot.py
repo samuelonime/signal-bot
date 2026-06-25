@@ -12,7 +12,15 @@ import time
 import logging
 import threading
 import requests
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+
+WAT = timezone(timedelta(hours=1))  # West Africa Time (UTC+1)
+
+def _to_wat(dt: datetime) -> datetime:
+    """Convert any datetime to WAT. Assumes UTC if naive."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(WAT)
 from typing import Optional, List
 from dotenv import load_dotenv
 
@@ -65,7 +73,7 @@ def _format_free_message(signal) -> str:
         f"{icon} <b>{signal.direction}</b> — {signal.asset}\n"
         f"⏳ Expiry: {signal.expiry_min} min\n"
         f"🤖 Confidence: <b>{signal.confidence:.0f}%</b>\n"
-        f"🕒 Time: {signal.timestamp.strftime('%H:%M UTC')}\n\n"
+        f"🕒 Time: {_to_wat(signal.timestamp).strftime('%H:%M WAT')}\n\n"
         f"📊 Full analysis available in VIP 👇\n"
         f"🔒 Join: {os.getenv('VIP_INVITE_LINK', 't.me/your_vip_link')}"
     )
@@ -86,7 +94,7 @@ def _format_vip_message(signal) -> str:
         f"💰 <b>Entry:</b>     <code>{signal.entry_price:.5f}</code>\n"
         f"🤖 <b>Confidence:</b> <b>{signal.confidence:.0f}%</b>\n"
         f"🌍 <b>Session:</b>   {signal.session}\n"
-        f"🕒 <b>UTC Time:</b>  {signal.timestamp.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        f"🕒 <b>WAT Time:</b>  {_to_wat(signal.timestamp).strftime('%Y-%m-%d %H:%M:%S')}\n\n"
         f"📋 <b>Analysis:</b>\n{reasons_html}{warn_html}\n\n"
         f"⚠️ <i>Risk disclaimer: Binary options carry significant financial risk. "
         f"Never trade with money you cannot afford to lose. Past performance does not guarantee future results.</i>"
@@ -114,7 +122,7 @@ def send_admin_alert(text: str):
 def send_performance_report(report_text: str, report_type: str = "Daily"):
     msg = (
         f"📊 <b>{report_type} Performance Report</b>\n"
-        f"🕒 {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n\n"
+        f"🕒 {_to_wat(datetime.now(timezone.utc)).strftime('%Y-%m-%d %H:%M WAT')}\n\n"
         f"{report_text}"
     )
     if VIP_CHANNEL:
@@ -244,7 +252,7 @@ class BotCommandHandler:
             uptime = _get_uptime()
             _send_message(chat_id,
                 f"✅ <b>Bot Status: ONLINE</b>\n"
-                f"🕒 {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n"
+                f"🕒 {_to_wat(datetime.now(timezone.utc)).strftime('%Y-%m-%d %H:%M WAT')}\n"
                 f"⏱️ Uptime: {uptime}\n\n"
                 f"📡 <b>Scanning:</b>\n"
                 f"  Pairs: EURUSD · GBPUSD · XAUUSD . USDJPY . BTC USD\n"
@@ -305,10 +313,10 @@ class BotCommandHandler:
 # Helpers
 # ---------------------------------------------------------------------------
 
-_start_time = datetime.utcnow()
+_start_time = datetime.now(timezone.utc)
 
 def _get_uptime() -> str:
-    delta = datetime.utcnow() - _start_time
+    delta = datetime.now(timezone.utc) - _start_time
     h, rem = divmod(int(delta.total_seconds()), 3600)
     m, s   = divmod(rem, 60)
     if h > 0:
