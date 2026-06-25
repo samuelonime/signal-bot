@@ -139,43 +139,35 @@ class AIConfidenceEngine:
 
     def _init_model(self):
         """
-        Initialise LightGBM (XGBoost fallback) with default params.
-        Model is trained via train() before use in production.
+        Initialise ML model with fallback chain:
+        XGBoost → sklearn GradientBoosting → heuristic only.
+        LightGBM is skipped entirely — it requires libgomp.so.1 (OpenMP)
+        which is not available on all Railway/Docker environments.
         """
         try:
-            import lightgbm as lgb
-            self.model = lgb.LGBMClassifier(
+            from xgboost import XGBClassifier
+            self.model = XGBClassifier(
                 n_estimators=300,
                 max_depth=6,
                 learning_rate=0.05,
-                num_leaves=31,
                 subsample=0.8,
                 colsample_bytree=0.8,
-                class_weight="balanced",
+                eval_metric="logloss",
                 random_state=42,
-                verbose=-1,
+                verbosity=0,
             )
-            logger.info("LightGBM model initialised.")
-        except ImportError:
+            logger.info("XGBoost model initialised.")
+        except (ImportError, Exception) as e:
+            logger.warning(f"XGBoost not available ({e}), trying sklearn...")
             try:
-                from xgboost import XGBClassifier
-                self.model = XGBClassifier(
-                    n_estimators=300,
-                    max_depth=6,
-                    learning_rate=0.05,
-                    subsample=0.8,
-                    colsample_bytree=0.8,
-                    use_label_encoder=False,
-                    eval_metric="logloss",
-                    random_state=42,
-                )
-                logger.info("XGBoost model initialised (LightGBM not available).")
-            except ImportError:
                 from sklearn.ensemble import GradientBoostingClassifier
                 self.model = GradientBoostingClassifier(
                     n_estimators=200, max_depth=5, learning_rate=0.05, random_state=42
                 )
-                logger.info("GradientBoosting (sklearn) model initialised as fallback.")
+                logger.info("GradientBoosting (sklearn) model initialised.")
+            except Exception as e2:
+                logger.warning(f"sklearn GradientBoosting failed ({e2}), using heuristic mode only.")
+                self.model = None
 
     def train(self, X: np.ndarray, y: np.ndarray):
         """
