@@ -405,7 +405,7 @@ def _build_reasons(direction, struct, ind, pa, ai, dt) -> List[str]:
 
     # 1. Trend
     trend_label = "Uptrend" if struct.trend == "bullish" else "Downtrend" if struct.trend == "bearish" else "Ranging market"
-    ema_symbol  = ">" if struct.trend == "bullish" else "<"
+    ema_symbol = "&gt;" if struct.trend == "bullish" else "&lt;"
     reasons.append(
         f"{trend_label} confirmed "
         f"(EMA 50 {ema_symbol} EMA 200, strength={struct.trend_strength:.0%})"
