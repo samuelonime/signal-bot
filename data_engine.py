@@ -1,11 +1,16 @@
 """
 Data Engine — fetches OHLC candlestick data and stores in PostgreSQL.
-Supports EURUSD, GBPUSD, XAUUSD, USDJPY, BTCUSD across M1, M5, M15 timeframes.
+Primary source: Deriv API (WebSocket, real-time, unlimited, Nigeria supported)
+Fallback: Twelve Data (REST, 800 req/day)
+Last resort: Synthetic data
 """
 
 import os
 import time
+import json
 import logging
+import asyncio
+import websockets
 import requests
 import pandas as pd
 import numpy as np
@@ -17,11 +22,25 @@ from dotenv import load_dotenv
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-ASSETS = ["EURUSD", "GBPUSD", "XAUUSD", "USDJPY", "BTCUSD"]
+ASSETS     = ["EURUSD", "GBPUSD", "XAUUSD", "USDJPY", "BTCUSD"]
 TIMEFRAMES = ["M1", "M5", "M15"]
 
-TF_MINUTES = {"M1": 1, "M5": 5, "M15": 15}
-TF_EXPIRY  = {"M1": 3,  "M5": 5, "M15": 15}
+TF_MINUTES = {"M1": 1,  "M5": 5,  "M15": 15}
+TF_EXPIRY  = {"M1": 3,  "M5": 5,  "M15": 15}
+
+# Deriv symbol mapping
+DERIV_SYMBOLS = {
+    "EURUSD": "frxEURUSD",
+    "GBPUSD": "frxGBPUSD",
+    "XAUUSD": "frxXAUUSD",
+    "USDJPY": "frxUSDJPY",
+    "BTCUSD": "cryBTCUSD",
+}
+
+# Deriv granularity in seconds
+DERIV_GRANULARITY = {"M1": 60, "M5": 300, "M15": 900}
+
+DERIV_WS_URL = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
 
 # ---------------------------------------------------------------------------
 # Database helpers
@@ -89,22 +108,78 @@ def init_db():
 
 
 # ---------------------------------------------------------------------------
-# Rotating API Key Manager
+# Deriv API — Primary real-time data source
+# ---------------------------------------------------------------------------
+
+async def _fetch_deriv_async(asset: str, timeframe: str, n_candles: int = 200) -> pd.DataFrame:
+    """Fetch OHLC candles from Deriv WebSocket API."""
+    symbol      = DERIV_SYMBOLS.get(asset)
+    granularity = DERIV_GRANULARITY.get(timeframe)
+
+    if not symbol or not granularity:
+        raise ValueError(f"Unsupported asset/timeframe: {asset}/{timeframe}")
+
+    token = os.getenv("DERIV_API_TOKEN", "")
+
+    async with websockets.connect(DERIV_WS_URL, ping_interval=20) as ws:
+
+        # Authenticate if token provided
+        if token:
+            await ws.send(json.dumps({"authorize": token}))
+            auth_resp = json.loads(await ws.recv())
+            if auth_resp.get("error"):
+                logger.warning(f"Deriv auth warning: {auth_resp['error']['message']} — continuing unauthenticated.")
+
+        # Request candles
+        request = {
+            "ticks_history": symbol,
+            "adjust_start_time": 1,
+            "count": n_candles,
+            "end": "latest",
+            "granularity": granularity,
+            "style": "candles",
+        }
+        await ws.send(json.dumps(request))
+        response = json.loads(await ws.recv())
+
+        if response.get("error"):
+            raise ValueError(f"Deriv error: {response['error']['message']}")
+
+        candles = response.get("candles", [])
+        if not candles:
+            raise ValueError(f"No candles returned from Deriv for {asset}/{timeframe}")
+
+        rows = []
+        for c in candles:
+            rows.append({
+                "timestamp": pd.to_datetime(c["epoch"], unit="s"),
+                "open":      float(c["open"]),
+                "high":      float(c["high"]),
+                "low":       float(c["low"]),
+                "close":     float(c["close"]),
+                "volume":    0.0,  # Deriv doesn't provide volume
+            })
+
+        df = pd.DataFrame(rows).sort_values("timestamp").reset_index(drop=True)
+        logger.info(f"✅ Deriv: fetched {len(df)} candles for {asset}/{timeframe} (real-time)")
+        return df
+
+
+def _fetch_deriv(asset: str, timeframe: str, n_candles: int = 200) -> pd.DataFrame:
+    """Sync wrapper for Deriv async fetch."""
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        return loop.run_until_complete(_fetch_deriv_async(asset, timeframe, n_candles))
+    finally:
+        loop.close()
+
+
+# ---------------------------------------------------------------------------
+# Twelve Data — Fallback with key rotation
 # ---------------------------------------------------------------------------
 
 class TwelveDataKeyManager:
-    """
-    Rotates between two (or more) Twelve Data API keys.
-    Switches automatically when a key hits its rate or daily limit.
-
-    Set in Railway environment variables:
-        TWELVE_DATA_KEY_1=your_first_key
-        TWELVE_DATA_KEY_2=your_second_key
-
-    Legacy single-key fallback still supported:
-        TWELVE_DATA_KEY=your_key
-    """
-
     def __init__(self):
         self.keys        = self._load_keys()
         self.current_idx = 0
@@ -116,54 +191,37 @@ class TwelveDataKeyManager:
             k = os.getenv(f"TWELVE_DATA_KEY_{i}", "").strip()
             if k:
                 keys.append(k)
-        # fallback: single key
         if not keys:
             k = os.getenv("TWELVE_DATA_KEY", "").strip()
             if k:
                 keys.append(k)
         if keys:
-            logger.info(f"TwelveDataKeyManager: {len(keys)} API key(s) loaded.")
-        else:
-            logger.warning("TwelveDataKeyManager: no API keys found — will use synthetic data.")
+            logger.info(f"TwelveDataKeyManager: {len(keys)} key(s) loaded (fallback).")
         return keys
 
     @property
     def active_key(self) -> str:
-        if not self.keys:
-            return ""
-        return self.keys[self.current_idx]
+        return self.keys[self.current_idx] if self.keys else ""
 
     @property
     def has_keys(self) -> bool:
         return bool(self.keys) and len(self.exhausted) < len(self.keys)
 
     def rotate(self, reason: str = "rate limit"):
-        """Mark current key as exhausted and switch to the next available one."""
         self.exhausted.add(self.current_idx)
         available = [i for i in range(len(self.keys)) if i not in self.exhausted]
-
         if not available:
-            logger.error(
-                f"All {len(self.keys)} Twelve Data key(s) exhausted ({reason}). "
-                f"Falling back to synthetic data until midnight UTC reset."
-            )
+            logger.error("All Twelve Data keys exhausted.")
             return
-
         self.current_idx = available[0]
-        logger.warning(
-            f"Twelve Data key rotated ({reason}). "
-            f"Now on key #{self.current_idx + 1}. "
-            f"{len(available) - 1} backup key(s) still available."
-        )
+        logger.warning(f"Twelve Data key rotated ({reason}). On key #{self.current_idx + 1}.")
 
     def reset_daily(self):
-        """Call at midnight UTC — Twelve Data resets quotas daily."""
         self.exhausted   = set()
         self.current_idx = 0
-        logger.info("TwelveDataKeyManager: daily reset — all keys active again.")
+        logger.info("TwelveDataKeyManager: daily reset.")
 
     def is_rate_limit(self, data: dict, status_code: int) -> bool:
-        """Detect rate limit from HTTP status or API response body."""
         if status_code == 429:
             return True
         if data.get("status") == "error":
@@ -174,23 +232,15 @@ class TwelveDataKeyManager:
         return False
 
 
-# Singleton — shared across all fetch calls in this process
 _key_manager = TwelveDataKeyManager()
 
 def get_key_manager() -> TwelveDataKeyManager:
     return _key_manager
 
 
-# ---------------------------------------------------------------------------
-# OHLC fetch — Twelve Data with key rotation, synthetic fallback
-# ---------------------------------------------------------------------------
-
 def _fetch_twelve_data(asset: str, timeframe: str) -> pd.DataFrame:
-    """
-    Fetch from Twelve Data. Rotates to backup key on rate limit.
-    """
     TD_INTERVAL = {"M1": "1min", "M5": "5min", "M15": "15min"}
-    interval = TD_INTERVAL[timeframe]
+    interval    = TD_INTERVAL[timeframe]
 
     if asset == "XAUUSD":
         symbol = "XAU/USD"
@@ -204,135 +254,129 @@ def _fetch_twelve_data(asset: str, timeframe: str) -> pd.DataFrame:
 
     for attempt in range(max_retries):
         if not km.has_keys:
-            raise ValueError("All Twelve Data API keys exhausted.")
+            raise ValueError("All Twelve Data keys exhausted.")
 
         url = (
             f"https://api.twelvedata.com/time_series"
-            f"?symbol={symbol}"
-            f"&interval={interval}"
-            f"&outputsize=200"
-            f"&apikey={km.active_key}"
+            f"?symbol={symbol}&interval={interval}"
+            f"&outputsize=200&apikey={km.active_key}"
         )
 
         try:
             resp = requests.get(url, timeout=15)
-
-            # HTTP 429 — rotate immediately and retry
             if resp.status_code == 429:
-                logger.warning(f"Key #{km.current_idx + 1} HTTP 429. Rotating...")
                 km.rotate("HTTP 429")
                 continue
 
             resp.raise_for_status()
             data = resp.json()
 
-            # API-level rate limit error — rotate and retry
             if km.is_rate_limit(data, resp.status_code):
-                logger.warning(
-                    f"Key #{km.current_idx + 1} limit: {data.get('message', '')}. Rotating..."
-                )
                 km.rotate(data.get("message", "limit"))
                 continue
 
             if data.get("status") == "error":
-                raise ValueError(f"Twelve Data error: {data.get('message', 'unknown')}")
+                raise ValueError(f"Twelve Data error: {data.get('message')}")
 
             if "values" not in data or not data["values"]:
-                raise ValueError(f"No data returned from Twelve Data for {asset}")
+                raise ValueError(f"No data from Twelve Data for {asset}")
 
             rows = []
-            for vals in data["values"]:
+            for v in data["values"]:
                 rows.append({
-                    "timestamp": pd.to_datetime(vals["datetime"]),
-                    "open":      float(vals["open"]),
-                    "high":      float(vals["high"]),
-                    "low":       float(vals["low"]),
-                    "close":     float(vals["close"]),
-                    "volume":    float(vals.get("volume", 0)),
+                    "timestamp": pd.to_datetime(v["datetime"]),
+                    "open":   float(v["open"]),
+                    "high":   float(v["high"]),
+                    "low":    float(v["low"]),
+                    "close":  float(v["close"]),
+                    "volume": float(v.get("volume", 0)),
                 })
 
             df = pd.DataFrame(rows).sort_values("timestamp").reset_index(drop=True)
-            logger.info(
-                f"Fetched {len(df)} candles for {asset} {timeframe} "
-                f"from Twelve Data (key #{km.current_idx + 1})."
-            )
+            logger.info(f"⚠️ Twelve Data fallback: {len(df)} candles for {asset}/{timeframe}")
             return df
 
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
-            logger.warning(f"Network error for {asset}/{timeframe}: {exc}")
+            logger.warning(f"Twelve Data network error: {exc}")
             if attempt < max_retries - 1:
                 time.sleep(2)
-            continue
 
-    raise ValueError(f"All fetch attempts failed for {asset}/{timeframe}")
+    raise ValueError(f"All Twelve Data fetch attempts failed for {asset}/{timeframe}")
 
+
+# ---------------------------------------------------------------------------
+# Synthetic data — Last resort
+# ---------------------------------------------------------------------------
 
 def _synthetic_ohlc(asset: str, timeframe: str, n_candles: int = 200) -> pd.DataFrame:
-    """
-    Deterministic synthetic OHLC for offline/demo use.
-    Seeds with asset+timeframe so results are reproducible.
-    """
     seed = abs(hash(asset + timeframe)) % (2**31)
     rng  = np.random.default_rng(seed)
 
     base_prices = {
-        "EURUSD": 1.0850,
-        "GBPUSD": 1.2700,
-        "XAUUSD": 2350.0,
-        "USDJPY": 150.0,
-        "BTCUSD": 65000.0,
+        "EURUSD": 1.0850, "GBPUSD": 1.2700, "XAUUSD": 2350.0,
+        "USDJPY": 150.0,  "BTCUSD": 65000.0,
     }
-    base = base_prices.get(asset, 1.0)
     sigma = {
-        "EURUSD": 0.0003,
-        "GBPUSD": 0.0004,
-        "XAUUSD": 0.8,
-        "USDJPY": 0.05,
-        "BTCUSD": 500.0,
-    }.get(asset, 0.0003)
-
+        "EURUSD": 0.0003, "GBPUSD": 0.0004, "XAUUSD": 0.8,
+        "USDJPY": 0.05,   "BTCUSD": 500.0,
+    }
+    base    = base_prices.get(asset, 1.0)
+    sig     = sigma.get(asset, 0.0003)
     minutes = TF_MINUTES[timeframe]
     now     = datetime.utcnow().replace(second=0, microsecond=0)
     start   = now - timedelta(minutes=minutes * n_candles)
-
     timestamps = [start + timedelta(minutes=i * minutes) for i in range(n_candles)]
-    closes     = base + np.cumsum(rng.normal(0, sigma, n_candles))
+    closes     = base + np.cumsum(rng.normal(0, sig, n_candles))
 
     rows = []
     for i, (ts, close) in enumerate(zip(timestamps, closes)):
         open_      = closes[i - 1] if i > 0 else close
         body       = abs(open_ - close)
-        upper_wick = abs(rng.normal(0, max(body * 1.2, sigma * 0.8)))
-        lower_wick = abs(rng.normal(0, max(body * 1.2, sigma * 0.8)))
-        high       = max(open_, close) + upper_wick
-        low        = min(open_, close) - lower_wick
-        volume     = rng.integers(200, 1000)
+        high       = max(open_, close) + abs(rng.normal(0, max(body * 1.2, sig * 0.8)))
+        low        = min(open_, close) - abs(rng.normal(0, max(body * 1.2, sig * 0.8)))
         rows.append({"timestamp": ts, "open": open_, "high": high,
-                     "low": low, "close": close, "volume": volume})
+                     "low": low, "close": close, "volume": rng.integers(200, 1000)})
 
+    logger.warning(f"⚠️ Using SYNTHETIC data for {asset}/{timeframe} — not for production!")
     return pd.DataFrame(rows)
 
 
+# ---------------------------------------------------------------------------
+# Primary fetch — Deriv → Twelve Data → Synthetic
+# ---------------------------------------------------------------------------
+
 def fetch_ohlc(asset: str, timeframe: str, n_candles: int = 200) -> pd.DataFrame:
     """
-    Primary fetch function.
-    Tries Twelve Data (with key rotation) first, falls back to synthetic data.
+    Fetch priority:
+    1. Deriv API  — real-time, unlimited, Nigeria supported
+    2. Twelve Data — fallback if Deriv fails
+    3. Synthetic   — last resort (not for production)
     """
+    # 1. Try Deriv
+    try:
+        df = _fetch_deriv(asset, timeframe, n_candles)
+        return df.tail(n_candles).reset_index(drop=True)
+    except Exception as exc:
+        logger.warning(f"Deriv fetch failed for {asset}/{timeframe}: {exc}")
+
+    # 2. Try Twelve Data
     km = get_key_manager()
     if km.has_keys:
         try:
             df = _fetch_twelve_data(asset, timeframe)
             return df.tail(n_candles).reset_index(drop=True)
         except Exception as exc:
-            logger.warning(f"Twelve Data fetch failed ({exc}), using synthetic data.")
+            logger.warning(f"Twelve Data fallback failed: {exc}")
 
-    df = _synthetic_ohlc(asset, timeframe, n_candles)
-    logger.info(f"Using synthetic data for {asset} {timeframe} ({len(df)} candles).")
-    return df
+    # 3. Synthetic last resort
+    return _synthetic_ohlc(asset, timeframe, n_candles)
 
+
+# ---------------------------------------------------------------------------
+# Store / Load
+# ---------------------------------------------------------------------------
 
 def store_ohlc(asset: str, timeframe: str, df: pd.DataFrame):
-    """Upsert OHLC rows into PostgreSQL."""
     engine = get_engine()
     upsert = text("""
         INSERT INTO ohlc_data (asset, timeframe, timestamp, open, high, low, close, volume)
@@ -347,16 +391,15 @@ def store_ohlc(asset: str, timeframe: str, df: pd.DataFrame):
             conn.execute(upsert, {
                 "asset": asset, "timeframe": timeframe,
                 "timestamp": row["timestamp"],
-                "open": float(row["open"]),   "high": float(row["high"]),
-                "low":  float(row["low"]),    "close": float(row["close"]),
+                "open":   float(row["open"]),  "high": float(row["high"]),
+                "low":    float(row["low"]),   "close": float(row["close"]),
                 "volume": float(row.get("volume", 0)),
             })
         conn.commit()
-    logger.debug(f"Stored {len(df)} rows for {asset} {timeframe}.")
+    logger.debug(f"Stored {len(df)} rows for {asset}/{timeframe}.")
 
 
 def load_ohlc(asset: str, timeframe: str, limit: int = 300) -> pd.DataFrame:
-    """Load the most recent candles from PostgreSQL."""
     engine = get_engine()
     sql = text("""
         SELECT timestamp, open, high, low, close, volume
@@ -380,7 +423,6 @@ def load_ohlc(asset: str, timeframe: str, limit: int = 300) -> pd.DataFrame:
 
 
 def refresh_all():
-    """Fetch and store fresh OHLC data for all assets and timeframes."""
     for asset in ASSETS:
         for tf in TIMEFRAMES:
             try:
@@ -388,7 +430,7 @@ def refresh_all():
                 store_ohlc(asset, tf, df)
             except Exception as exc:
                 logger.error(f"refresh_all failed for {asset}/{tf}: {exc}")
-            time.sleep(0.5)
+            time.sleep(0.3)
 
 
 if __name__ == "__main__":
