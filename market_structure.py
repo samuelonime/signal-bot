@@ -158,10 +158,10 @@ def _detect_trend(df: pd.DataFrame) -> Tuple[str, float]:
 def _detect_breakout(df: pd.DataFrame, resistance: List[float], support: List[float]) -> Tuple[Optional[str], bool]:
     """
     Check if the last candles broke through a key level.
-    TRUE Fakeout:
-      - Bullish fakeout: closed ABOVE resistance then came BACK below within 2 bars
-      - Bearish fakeout: closed BELOW support then came BACK above within 2 bars
-    A wick touching a level without a close is NOT a fakeout — it is noise.
+    TRUE Fakeout (strict definition to avoid false positives on real data):
+      - Price closed CLEARLY beyond a level (by more than 0.05% buffer)
+      - Then closed CLEARLY back inside within 2 bars
+    A single candle touching a level is NOT a fakeout.
     """
     if len(df) < 5 or (not resistance and not support):
         return None, False
@@ -175,19 +175,23 @@ def _detect_breakout(df: pd.DataFrame, resistance: List[float], support: List[fl
     fakeout       = False
 
     for r in resistance:
-        # Breakout: previous close was below, current close is above
+        # Breakout: prev bar closed below, current bar closes above
         if prev_close < r <= latest_close:
             breakout_type = "bullish_break"
-        # True fakeout: a prior BAR *closed* above resistance, but now price closed back below
-        if prev2_close > r and latest_close < r:
+        # Fakeout: prev2 closed clearly ABOVE resistance (by >0.05%)
+        # AND current close is clearly BACK BELOW resistance (by >0.05%)
+        buffer = r * 0.0005
+        if prev2_close > r + buffer and latest_close < r - buffer:
             fakeout = True
 
     for s in support:
-        # Breakdown: previous close was above, current close is below
+        # Breakdown: prev bar closed above, current bar closes below
         if prev_close > s >= latest_close:
             breakout_type = "bearish_break"
-        # True fakeout: a prior BAR *closed* below support, but now price closed back above
-        if prev2_close < s and latest_close > s:
+        # Fakeout: prev2 closed clearly BELOW support (by >0.05%)
+        # AND current close is clearly BACK ABOVE support (by >0.05%)
+        buffer = s * 0.0005
+        if prev2_close < s - buffer and latest_close > s + buffer:
             fakeout = True
 
     return breakout_type, fakeout
