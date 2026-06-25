@@ -400,45 +400,93 @@ def _resolve_direction(struct, ind, pa):
 
 def _build_reasons(direction, struct, ind, pa, ai, dt) -> List[str]:
     reasons = []
+    is_call = direction == "CALL"
+    is_put  = direction == "PUT"
 
+    # 1. Trend
+    trend_label = "Uptrend" if struct.trend == "bullish" else "Downtrend" if struct.trend == "bearish" else "Ranging market"
+    ema_symbol  = ">" if struct.trend == "bullish" else "<"
     reasons.append(
-        f"{'Uptrend' if struct.trend == 'bullish' else 'Downtrend'} confirmed "
-        f"(EMA 50 {'>' if struct.trend == 'bullish' else '<'} EMA 200, "
-        f"strength={struct.trend_strength:.0%})"
+        f"{trend_label} confirmed "
+        f"(EMA 50 {ema_symbol} EMA 200, strength={struct.trend_strength:.0%})"
     )
 
-    if struct.at_support and direction == "CALL":
-        reasons.append(f"Price at key support zone ({struct.nearest_support:.5f})")
-    if struct.at_resistance and direction == "PUT":
-        reasons.append(f"Price at key resistance zone ({struct.nearest_resistance:.5f})")
+    # 2. Support / Resistance — both directions
+    if struct.at_support:
+        if is_call:
+            reasons.append(f"Price bouncing off key support ({struct.nearest_support:.5f}) — bullish reversal zone")
+        else:
+            reasons.append(f"Price breaking below support ({struct.nearest_support:.5f}) — bearish continuation")
+
+    if struct.at_resistance:
+        if is_put:
+            reasons.append(f"Price rejected at key resistance ({struct.nearest_resistance:.5f}) — bearish reversal zone")
+        else:
+            reasons.append(f"Price breaking above resistance ({struct.nearest_resistance:.5f}) — bullish continuation")
+
+    # 3. Pullback
     if struct.pullback:
-        reasons.append(f"Clean {'bullish' if direction == 'CALL' else 'bearish'} pullback to key level")
+        if is_call:
+            reasons.append("Bullish pullback to key level — trend continuation setup")
+        else:
+            reasons.append("Bearish pullback to key level — trend continuation setup")
+
+    # 4. Breakout
     if struct.breakout:
         reasons.append(f"Structural breakout: {struct.breakout.replace('_', ' ').title()}")
 
+    # 5. Price action pattern — both directions
     if pa.dominant_pattern:
         reasons.append(f"{pa.dominant_pattern.name} — {pa.dominant_pattern.description}")
+    if is_call and pa.bullish_bias > 0.5:
+        reasons.append(f"Bullish candle bias confirmed (score={pa.bullish_bias:.2f})")
+    if is_put and pa.bearish_bias > 0.5:
+        reasons.append(f"Bearish candle bias confirmed (score={pa.bearish_bias:.2f})")
 
-    if ind.rsi_zone == "oversold" and direction == "CALL":
-        reasons.append(f"RSI({ind.rsi:.1f}) recovering from oversold zone")
-    elif ind.rsi_zone == "overbought" and direction == "PUT":
-        reasons.append(f"RSI({ind.rsi:.1f}) retreating from overbought zone")
+    # 6. RSI — both directions
+    if ind.rsi_zone == "oversold":
+        reasons.append(f"RSI({ind.rsi:.1f}) in oversold zone — {'bullish reversal likely' if is_call else 'extreme weakness, continuation risk'}")
+    elif ind.rsi_zone == "overbought":
+        reasons.append(f"RSI({ind.rsi:.1f}) in overbought zone — {'bearish reversal likely' if is_put else 'extreme strength, continuation possible'}")
+    elif ind.rsi > 55 and is_call:
+        reasons.append(f"RSI({ind.rsi:.1f}) above 55 — mild bullish momentum")
+    elif ind.rsi < 45 and is_put:
+        reasons.append(f"RSI({ind.rsi:.1f}) below 45 — mild bearish momentum")
     else:
-        reasons.append(f"RSI at {ind.rsi:.1f} — aligned with {direction.lower()} bias")
+        reasons.append(f"RSI({ind.rsi:.1f}) neutral — direction confirmed by structure and price action")
 
-    if ind.macd_cross:
-        reasons.append(f"MACD {ind.macd_cross} crossover confirmed")
-    elif ind.macd_hist > 0 and direction == "CALL":
-        reasons.append("MACD histogram positive — bullish momentum building")
-    elif ind.macd_hist < 0 and direction == "PUT":
-        reasons.append("MACD histogram negative — bearish momentum building")
+    # 7. MACD — both directions
+    if ind.macd_cross == "bullish":
+        reasons.append(f"MACD bullish crossover confirmed — {'momentum aligns with CALL' if is_call else 'crossover conflict, structure dominant'}")
+    elif ind.macd_cross == "bearish":
+        reasons.append(f"MACD bearish crossover confirmed — {'momentum aligns with PUT' if is_put else 'crossover conflict, structure dominant'}")
+    elif ind.macd_hist > 0:
+        if is_call:
+            reasons.append("MACD histogram positive — bullish momentum building")
+        else:
+            reasons.append("MACD histogram positive but weakening — bearish structure override")
+    elif ind.macd_hist < 0:
+        if is_put:
+            reasons.append("MACD histogram negative — bearish momentum building")
+        else:
+            reasons.append("MACD histogram negative but reversing — bullish structure override")
 
+    # 8. EMA trend context
+    if ind.ema_trend == "bullish" and is_call:
+        reasons.append(f"EMA trend bullish (spread={ind.ema_spread_pct:.2f}%) — trade with trend")
+    elif ind.ema_trend == "bearish" and is_put:
+        reasons.append(f"EMA trend bearish (spread={ind.ema_spread_pct:.2f}%) — trade with trend")
+    elif ind.ema_trend == "neutral":
+        reasons.append(f"EMA trend neutral — signal driven by price action and structure")
+
+    # 9. AI score
     reasons.append(
         f"AI confidence: {ai.confidence:.0f}% "
         f"({'ML' if ai.model_mode == 'ml' else 'Heuristic'} | "
         f"P(UP)={ai.prob_up:.1%} P(DN)={ai.prob_down:.1%})"
     )
 
+    # 10. Session
     reasons.append(f"Session: {get_current_session(dt)}")
 
     return reasons
