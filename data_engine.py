@@ -450,7 +450,7 @@ def refresh_all():
         except Exception as exc:
             logger.error(f"refresh_all failed for {asset}/{tf}: {exc}")
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
         futures = [executor.submit(fetch_and_store, asset, tf) for asset, tf in pairs]
         concurrent.futures.wait(futures)
 
