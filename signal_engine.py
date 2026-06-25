@@ -328,34 +328,51 @@ def _resolve_direction_verbose(
     """Returns (direction, votes_dict) for logging."""
     votes = {"CALL": 0, "PUT": 0}
 
-    # Structure votes
-    if struct.trend == "bullish" and (struct.at_support or struct.pullback):
-        votes["CALL"] += 3
-    elif struct.trend == "bearish" and (struct.at_resistance or struct.pullback):
-        votes["PUT"]  += 3
+    # --- Structure votes (split so both directions are equally reachable) ---
+    if struct.trend == "bullish":
+        if struct.at_support:
+            votes["CALL"] += 3   # price bouncing off support in uptrend
+        if struct.pullback:
+            votes["CALL"] += 2   # pullback in uptrend = buy dip
+    elif struct.trend == "bearish":
+        if struct.at_resistance:
+            votes["PUT"] += 3    # price rejected at resistance in downtrend
+        if struct.pullback:
+            votes["PUT"] += 2    # pullback in downtrend = sell rally
 
+    # --- Breakout votes ---
     if struct.breakout == "bullish_break":
         votes["CALL"] += 2
     elif struct.breakout == "bearish_break":
         votes["PUT"]  += 2
 
-    # Indicator votes
+    # --- EMA trend — reduced weight to avoid long-term uptrend bias ---
     if ind.ema_trend == "bullish":
-        votes["CALL"] += 2
+        votes["CALL"] += 1   # was 2, reduced to 1
     elif ind.ema_trend == "bearish":
-        votes["PUT"]  += 2
+        votes["PUT"]  += 1   # was 2, reduced to 1
 
+    # --- RSI — increased weight, added neutral zone scoring ---
     if ind.rsi_zone == "oversold":
-        votes["CALL"] += 1
+        votes["CALL"] += 2   # was 1, increased — strong reversal signal
     elif ind.rsi_zone == "overbought":
-        votes["PUT"]  += 1
+        votes["PUT"]  += 2   # was 1, increased — strong reversal signal
+    elif ind.rsi > 55:
+        votes["CALL"] += 1   # mild bullish momentum (new)
+    elif ind.rsi < 45:
+        votes["PUT"]  += 1   # mild bearish momentum (new)
 
+    # --- MACD — added histogram scoring for when no cross yet ---
     if ind.macd_cross == "bullish":
         votes["CALL"] += 2
     elif ind.macd_cross == "bearish":
         votes["PUT"]  += 2
+    elif ind.macd_hist > 0:
+        votes["CALL"] += 1   # building bullish momentum (new)
+    elif ind.macd_hist < 0:
+        votes["PUT"]  += 1   # building bearish momentum (new)
 
-    # Price action votes
+    # --- Price action votes ---
     if pa.dominant_pattern:
         if pa.dominant_pattern.direction == "bullish":
             votes["CALL"] += int(pa.dominant_pattern.strength * 3)
