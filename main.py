@@ -6,6 +6,7 @@ Runs the signal bot in a loop:
   - Send qualifying signals to Telegram
   - Generate daily/weekly reports on schedule
   - Poll Telegram for bot commands
+  - Reset Twelve Data API keys at midnight UTC
 
 Usage:
   python main.py                  # run live bot
@@ -35,7 +36,7 @@ logger = logging.getLogger("main")
 
 def run_live_bot():
     """Main loop: data refresh → scan → Telegram → sleep."""
-    from data_engine   import init_db, refresh_all
+    from data_engine   import init_db, refresh_all, get_key_manager
     from signal_engine import scan_all
     from telegram_bot  import send_signal, send_admin_alert, BotCommandHandler
     from performance_tracker import generate_daily_report, generate_weekly_report
@@ -47,11 +48,12 @@ def run_live_bot():
     init_db()
     send_admin_alert("🚀 Signal Bot Pro is now online and scanning markets.")
 
-    cmd_handler       = BotCommandHandler()
+    cmd_handler        = BotCommandHandler()
     cmd_handler.start()   # launches background thread — commands respond instantly
-    last_data_refresh = datetime.min
-    last_daily_report = datetime.min
+    last_data_refresh  = datetime.min
+    last_daily_report  = datetime.min
     last_weekly_report = datetime.min
+    last_midnight_reset = datetime.min
 
     SCAN_INTERVAL    = int(os.getenv("SCAN_INTERVAL_SEC",    "60"))
     REFRESH_INTERVAL = int(os.getenv("REFRESH_INTERVAL_SEC", "60"))
@@ -60,7 +62,13 @@ def run_live_bot():
         try:
             now = datetime.utcnow()
 
-            # 1. Refresh OHLC data
+            # 1. Midnight reset — Twelve Data quotas refresh at 00:00 UTC
+            if now.hour == 0 and now.minute == 0 and (now - last_midnight_reset).seconds > 3600:
+                get_key_manager().reset_daily()
+                last_midnight_reset = now
+                logger.info("Midnight UTC — Twelve Data API keys reset.")
+
+            # 2. Refresh OHLC data
             if (now - last_data_refresh).seconds >= REFRESH_INTERVAL:
                 logger.info("Refreshing OHLC data...")
                 try:
@@ -69,7 +77,7 @@ def run_live_bot():
                 except Exception as exc:
                     logger.error(f"Data refresh failed: {exc}")
 
-            # 2. Scan for signals
+            # 3. Scan for signals
             logger.info("Scanning for signals...")
             signals = scan_all(dt=now)
 
@@ -80,7 +88,7 @@ def run_live_bot():
             if not signals:
                 logger.info("  No qualifying signals this scan.")
 
-            # 3. Daily report at 22:00 UTC
+            # 4. Daily report at 22:00 UTC
             if now.hour == 22 and (now - last_daily_report).seconds > 3600:
                 report = generate_daily_report()
                 from telegram_bot import send_performance_report
@@ -88,7 +96,7 @@ def run_live_bot():
                 last_daily_report = now
                 logger.info("Daily report sent.")
 
-            # 4. Weekly report Sunday 22:00 UTC
+            # 5. Weekly report Sunday 22:00 UTC
             if now.weekday() == 6 and now.hour == 22 and (now - last_weekly_report).seconds > 3600:
                 report = generate_weekly_report()
                 from telegram_bot import send_performance_report
@@ -121,7 +129,6 @@ def run_backtest():
 
     print(result.summary())
 
-    # Plot equity curve
     if result.equity_curve:
         plt.figure(figsize=(12, 5))
         plt.plot(result.equity_curve, color="#00D4FF", linewidth=1.5)
