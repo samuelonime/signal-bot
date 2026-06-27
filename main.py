@@ -52,10 +52,10 @@ def run_live_bot():
     logger.info("  Signal Bot Pro — Starting")
     logger.info("=" * 60)
 
-   init_db()
-   from user_manager import init_user_tables
-   init_user_tables()
-   send_admin_alert("🚀 Signal Bot Pro is now online and scanning markets.")
+    init_db()
+    from user_manager import init_user_tables
+    init_user_tables()
+    send_admin_alert("🚀 Signal Bot Pro is now online and scanning markets.")
 
     cmd_handler = BotCommandHandler()
     cmd_handler.start()
