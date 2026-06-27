@@ -45,6 +45,17 @@ TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
 _pending_trades: dict = {}   # signal_key → trade info
 _awaiting_amount: dict = {}  # chat_id → signal_key (user typing custom amount)
 
+# Persistent reply keyboard shown at bottom of every chat
+MAIN_MENU_KEYBOARD = {
+    "keyboard": [
+        [{"text": "📊 Pairs"},       {"text": "✅ Status"},     {"text": "📈 Stats"}],
+        [{"text": "🔗 Connect"},     {"text": "💰 Balance"},    {"text": "👤 My Account"}],
+        [{"text": "💵 Set Amount"},  {"text": "❌ Disconnect"}, {"text": "📖 Help"}],
+    ],
+    "resize_keyboard": True,
+    "persistent": True,
+}
+
 
 # ---------------------------------------------------------------------------
 # Low-level senders
@@ -486,7 +497,20 @@ class BotCommandHandler:
                 if amount < 1:
                     _send_message(chat_id, "❌ Minimum amount is $1. Try again:")
                     return
+
                 signal_key = _awaiting_amount.pop(chat_id)
+
+                # Setting default amount via button
+                if signal_key == "__setamount__":
+                    from user_manager import set_amount
+                    set_amount(chat_id, amount)
+                    _send_message(chat_id,
+                        f"✅ <b>Default amount set to ${amount:.2f}</b>\n\n"
+                        f"You can still change it per signal using ✏️ Type Amount."
+                    )
+                    return
+
+                # Setting amount for a pending trade
                 trade = _pending_trades.get(signal_key)
                 if not trade:
                     _send_message(chat_id, "⏰ Signal expired. Wait for the next signal.")
@@ -505,6 +529,21 @@ class BotCommandHandler:
                 )
                 return
 
+        # Map button texts to commands
+        button_map = {
+            "📊 Pairs":       "/pairs",
+            "✅ Status":      "/status",
+            "📈 Stats":       "/stats",
+            "🔗 Connect":     "/connect",
+            "💰 Balance":     "/balance",
+            "👤 My Account":  "/myaccount",
+            "💵 Set Amount":  "/setamount",
+            "❌ Disconnect":  "/disconnect",
+            "📖 Help":        "/help",
+        }
+        if text in button_map:
+            text = button_map[text]
+
         # --- Commands ---
         if text.startswith("/start"):
             _send_message(chat_id,
@@ -514,17 +553,10 @@ class BotCommandHandler:
                 "<b>Signal Types:</b>\n"
                 "🟢 <b>CALL ↑</b> — Price expected to RISE\n"
                 "🔴 <b>PUT ↓</b> — Price expected to FALL\n\n"
-                "<b>Commands:</b>\n"
-                "/connect     — Link your Deriv account\n"
-                "/disconnect  — Unlink Deriv account\n"
-                "/balance     — Check Deriv balance\n"
-                "/setamount   — Set default trade amount\n"
-                "/myaccount   — View your settings\n"
-                "/status      — Bot status &amp; uptime\n"
-                "/stats       — Today's performance\n"
-                "/pairs       — Scanned assets &amp; timeframes\n"
-                "/help        — Show this menu\n\n"
-                "⚠️ <i>Trading involves significant risk. Never invest more than you can afford to lose.</i>"
+                "Use the menu buttons below to get started.\n"
+                "Connect your Deriv account to execute trades directly from signals.\n\n"
+                "⚠️ <i>Trading involves significant risk. Never invest more than you can afford to lose.</i>",
+                reply_markup=MAIN_MENU_KEYBOARD
             )
 
         elif text.startswith("/connect"):
@@ -603,11 +635,12 @@ class BotCommandHandler:
         elif text.startswith("/setamount"):
             parts = text.split(maxsplit=1)
             if len(parts) < 2:
+                _awaiting_amount[chat_id] = "__setamount__"
                 _send_message(chat_id,
                     "💵 <b>Set Default Trade Amount</b>\n\n"
-                    "Usage: <code>/setamount 10</code>\n\n"
-                    "This sets your default amount per trade.\n"
-                    "You can still type any custom amount per signal."
+                    "Type your amount and send e.g. <code>10</code> or <code>25.50</code>\n\n"
+                    "This sets your default per trade.\n"
+                    "You can still change it per signal using ✏️ Type Amount."
                 )
                 return
             try:
