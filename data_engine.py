@@ -41,7 +41,31 @@ DERIV_GRANULARITY = {"M1": 60, "M2": 120, "M3": 180, "M5": 300, "M15": 900}
 
 DERIV_WS_URL = "wss://ws.binaryws.com/websockets/v3?app_id=36544"
 
-_db_lock = threading.Lock()
+
+# ---------------------------------------------------------------------------
+# Helper — force clean numeric/datetime dtypes (prevents segfault)
+# ---------------------------------------------------------------------------
+
+def _clean_dtypes(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Force every column to a clean fixed dtype.
+    PostgreSQL NUMERIC returns Decimal objects stored as 'object' dtype,
+    which causes a C-level segfault in pandas take_nd/maybe_promote during
+    row reindexing (sort_values, iloc). Converting to float64 fixes it.
+    """
+    if df.empty:
+        return df
+    for col in ["open", "high", "low", "close", "volume"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").astype("float64")
+    if "timestamp" in df.columns:
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
+        # strip tz so all timestamps are naive and uniform
+        try:
+            df["timestamp"] = df["timestamp"].dt.tz_localize(None)
+        except (TypeError, AttributeError):
+            pass
+    return df
 
 
 # ---------------------------------------------------------------------------
@@ -162,10 +186,11 @@ async def _fetch_deriv_async(asset: str, timeframe: str, n_candles: int = 200) -
             })
 
         df = pd.DataFrame(rows)
-        # Safe sort — handles duplicates and NaN timestamps
+        df = _clean_dtypes(df)
         df = df.dropna(subset=["timestamp", "open", "high", "low", "close"])
         df = df.drop_duplicates(subset=["timestamp"])
-        df = df.sort_values("timestamp").reset_index(drop=True)
+        idx = df["timestamp"].values.argsort()
+        df  = df.iloc[idx].reset_index(drop=True)
 
         logger.info(f"✅ Deriv: fetched {len(df)} candles for {asset}/{timeframe} (real-time)")
         return df
@@ -301,9 +326,11 @@ def _fetch_twelve_data(asset: str, timeframe: str) -> pd.DataFrame:
                 })
 
             df = pd.DataFrame(rows)
+            df = _clean_dtypes(df)
             df = df.dropna(subset=["timestamp", "open", "high", "low", "close"])
             df = df.drop_duplicates(subset=["timestamp"])
-            df = df.sort_values("timestamp").reset_index(drop=True)
+            idx = df["timestamp"].values.argsort()
+            df  = df.iloc[idx].reset_index(drop=True)
             logger.info(f"⚠️ Twelve Data fallback: {len(df)} candles for {asset}/{timeframe}")
             return df
 
@@ -349,7 +376,7 @@ def _synthetic_ohlc(asset: str, timeframe: str, n_candles: int = 200) -> pd.Data
                      "low": low, "close": close, "volume": rng.integers(200, 1000)})
 
     logger.warning(f"⚠️ Using SYNTHETIC data for {asset}/{timeframe} — not for production!")
-    return pd.DataFrame(rows)
+    return _clean_dtypes(pd.DataFrame(rows))
 
 
 # ---------------------------------------------------------------------------
@@ -378,7 +405,7 @@ def fetch_ohlc(asset: str, timeframe: str, n_candles: int = 200) -> pd.DataFrame
 
 
 # ---------------------------------------------------------------------------
-# Store / Load — thread-safe via _db_lock
+# Store / Load — PostgreSQL handles concurrency natively (no _db_lock)
 # ---------------------------------------------------------------------------
 
 def store_ohlc(asset: str, timeframe: str, df: pd.DataFrame):
@@ -408,6 +435,9 @@ def store_ohlc(asset: str, timeframe: str, df: pd.DataFrame):
                 volume=EXCLUDED.volume
     """)
 
+    # No lock — PostgreSQL handles concurrent upserts natively via the
+    # UNIQUE constraint + ON CONFLICT clause. This lets all 25 workers
+    # write in parallel instead of waiting in line.
     engine = get_engine()
     with engine.connect() as conn:
         conn.execute(upsert, rows)
@@ -419,8 +449,8 @@ def store_ohlc(asset: str, timeframe: str, df: pd.DataFrame):
 def load_ohlc(asset: str, timeframe: str, limit: int = 300) -> pd.DataFrame:
     """
     Load most recent candles from PostgreSQL.
-    Thread-safe via _db_lock.
-    Includes safety guards against NaN/duplicate timestamps that cause segfault.
+    Forces clean float64/datetime dtypes to prevent the pandas
+    take_nd/maybe_promote segfault caused by Decimal/object columns.
     """
     sql = text("""
         SELECT timestamp, open, high, low, close, volume
@@ -438,6 +468,7 @@ def load_ohlc(asset: str, timeframe: str, limit: int = 300) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
 
+    # Build with explicit float() conversion up front
     records = [
         {
             "timestamp": row[0],
@@ -451,21 +482,8 @@ def load_ohlc(asset: str, timeframe: str, limit: int = 300) -> pd.DataFrame:
     ]
 
     df = pd.DataFrame(records)
+    df = _clean_dtypes(df)   # force float64 + naive datetime — kills the segfault
 
-    # Convert timestamps — strip timezone info to avoid Python 3.13 + pandas segfault
-    # on sort_values with timezone-aware TIMESTAMPTZ from PostgreSQL
-    def _safe_ts(ts):
-        try:
-            t = pd.to_datetime(ts, errors="coerce", utc=True)
-            if pd.isna(t):
-                return pd.NaT
-            return t.tz_localize(None) if t.tzinfo is None else t.tz_convert(None)
-        except Exception:
-            return pd.NaT
-
-    df["timestamp"] = df["timestamp"].apply(_safe_ts)
-
-    # Safety guards
     df = df.dropna(subset=["timestamp", "open", "high", "low", "close"])
     df = df.drop_duplicates(subset=["timestamp"])
 
@@ -473,7 +491,7 @@ def load_ohlc(asset: str, timeframe: str, limit: int = 300) -> pd.DataFrame:
         logger.warning(f"Insufficient data for {asset}/{timeframe}: only {len(df)} rows")
         return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
 
-    # Use numpy argsort instead of pandas sort_values to avoid segfault
+    # numpy argsort on clean float64 timestamps — safe, no segfault
     idx = df["timestamp"].values.argsort()
     df  = df.iloc[idx].reset_index(drop=True)
     return df
