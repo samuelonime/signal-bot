@@ -10,6 +10,7 @@ import time
 import json
 import logging
 import asyncio
+import threading
 import websockets
 import requests
 import pandas as pd
@@ -41,6 +42,10 @@ DERIV_SYMBOLS = {
 DERIV_GRANULARITY = {"M1": 60, "M2": 120, "M3": 180, "M5": 300, "M15": 900}
 
 DERIV_WS_URL = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
+
+# Thread lock — prevents race condition between parallel fetch (write) and scan (read)
+_db_lock = threading.Lock()
+
 
 # ---------------------------------------------------------------------------
 # Database helpers
@@ -119,16 +124,21 @@ async def _fetch_deriv_async(asset: str, timeframe: str, n_candles: int = 200) -
     if not symbol or not granularity:
         raise ValueError(f"Unsupported asset/timeframe: {asset}/{timeframe}")
 
-    token = os.getenv("DERIV_API_TOKEN", "")
+    token = os.getenv("DERIV_API_TOKEN", "").strip()
 
     async with websockets.connect(DERIV_WS_URL, ping_interval=20) as ws:
 
-        # Authenticate if token provided
+        # Authenticate only if token is set and looks valid (non-empty)
         if token:
             await ws.send(json.dumps({"authorize": token}))
             auth_resp = json.loads(await ws.recv())
             if auth_resp.get("error"):
-                logger.warning(f"Deriv auth warning: {auth_resp['error']['message']} — continuing unauthenticated.")
+                # Log once at DEBUG level — not a critical error, data still flows
+                logger.debug(
+                    f"Deriv auth skipped ({auth_resp['error']['message']}) "
+                    f"— fetching unauthenticated."
+                )
+                # Don't return — unauthenticated data fetch still works
 
         # Request candles
         request = {
@@ -157,7 +167,7 @@ async def _fetch_deriv_async(asset: str, timeframe: str, n_candles: int = 200) -
                 "high":      float(c["high"]),
                 "low":       float(c["low"]),
                 "close":     float(c["close"]),
-                "volume":    0.0,  # Deriv doesn't provide volume
+                "volume":    0.0,
             })
 
         df = pd.DataFrame(rows).sort_values("timestamp").reset_index(drop=True)
@@ -240,7 +250,10 @@ def get_key_manager() -> TwelveDataKeyManager:
 
 def _fetch_twelve_data(asset: str, timeframe: str) -> pd.DataFrame:
     TD_INTERVAL = {"M1": "1min", "M5": "5min", "M15": "15min"}
-    interval    = TD_INTERVAL[timeframe]
+    interval    = TD_INTERVAL.get(timeframe)
+
+    if not interval:
+        raise ValueError(f"Twelve Data does not support timeframe {timeframe}")
 
     if asset == "XAUUSD":
         symbol = "XAU/USD"
@@ -330,10 +343,10 @@ def _synthetic_ohlc(asset: str, timeframe: str, n_candles: int = 200) -> pd.Data
 
     rows = []
     for i, (ts, close) in enumerate(zip(timestamps, closes)):
-        open_      = closes[i - 1] if i > 0 else close
-        body       = abs(open_ - close)
-        high       = max(open_, close) + abs(rng.normal(0, max(body * 1.2, sig * 0.8)))
-        low        = min(open_, close) - abs(rng.normal(0, max(body * 1.2, sig * 0.8)))
+        open_  = closes[i - 1] if i > 0 else close
+        body   = abs(open_ - close)
+        high   = max(open_, close) + abs(rng.normal(0, max(body * 1.2, sig * 0.8)))
+        low    = min(open_, close) - abs(rng.normal(0, max(body * 1.2, sig * 0.8)))
         rows.append({"timestamp": ts, "open": open_, "high": high,
                      "low": low, "close": close, "volume": rng.integers(200, 1000)})
 
@@ -348,7 +361,7 @@ def _synthetic_ohlc(asset: str, timeframe: str, n_candles: int = 200) -> pd.Data
 def fetch_ohlc(asset: str, timeframe: str, n_candles: int = 200) -> pd.DataFrame:
     """
     Fetch priority:
-    1. Deriv API  — real-time, unlimited, Nigeria supported
+    1. Deriv API   — real-time, unlimited, Nigeria supported
     2. Twelve Data — fallback if Deriv fails
     3. Synthetic   — last resort (not for production)
     """
@@ -373,16 +386,18 @@ def fetch_ohlc(asset: str, timeframe: str, n_candles: int = 200) -> pd.DataFrame
 
 
 # ---------------------------------------------------------------------------
-# Store / Load
+# Store / Load — thread-safe via _db_lock
 # ---------------------------------------------------------------------------
 
 def store_ohlc(asset: str, timeframe: str, df: pd.DataFrame):
-    """Bulk upsert — inserts all rows in one query instead of row-by-row."""
+    """
+    Bulk upsert — all rows in one round-trip.
+    Thread-safe via _db_lock.
+    """
     if df.empty:
         return
 
-    engine = get_engine()
-    rows   = [
+    rows = [
         {
             "asset":     asset,
             "timeframe": timeframe,
@@ -405,15 +420,20 @@ def store_ohlc(asset: str, timeframe: str, df: pd.DataFrame):
                 volume=EXCLUDED.volume
     """)
 
-    with engine.connect() as conn:
-        conn.execute(upsert, rows)   # bulk — all rows in one round-trip
-        conn.commit()
+    with _db_lock:
+        engine = get_engine()
+        with engine.connect() as conn:
+            conn.execute(upsert, rows)
+            conn.commit()
 
     logger.debug(f"Stored {len(df)} rows for {asset}/{timeframe}.")
 
 
 def load_ohlc(asset: str, timeframe: str, limit: int = 300) -> pd.DataFrame:
-    engine = get_engine()
+    """
+    Load most recent candles from PostgreSQL.
+    Thread-safe via _db_lock — prevents race condition with parallel writes.
+    """
     sql = text("""
         SELECT timestamp, open, high, low, close, volume
         FROM ohlc_data
@@ -421,22 +441,37 @@ def load_ohlc(asset: str, timeframe: str, limit: int = 300) -> pd.DataFrame:
         ORDER BY timestamp DESC
         LIMIT :lim
     """)
-    with engine.connect() as conn:
-        result = conn.execute(sql, {"asset": asset, "tf": timeframe, "lim": limit})
-        rows   = result.fetchall()
+
+    with _db_lock:
+        engine = get_engine()
+        with engine.connect() as conn:
+            result = conn.execute(sql, {"asset": asset, "tf": timeframe, "lim": limit})
+            rows   = result.fetchall()
 
     if not rows:
-        return pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
+        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
 
-    df = pd.DataFrame(rows, columns=["timestamp","open","high","low","close","volume"])
+    # Build DataFrame outside the lock — pure pandas, no DB access
+    records = [
+        {
+            "timestamp": row[0],
+            "open":   float(row[1]),
+            "high":   float(row[2]),
+            "low":    float(row[3]),
+            "close":  float(row[4]),
+            "volume": float(row[5]) if row[5] is not None else 0.0,
+        }
+        for row in rows
+    ]
+
+    df = pd.DataFrame(records)
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
     df = df.sort_values("timestamp").reset_index(drop=True)
-    for col in ["open","high","low","close","volume"]:
-        df[col] = pd.to_numeric(df[col])
     return df
 
 
 def refresh_all():
-    """Fetch all assets and timeframes in parallel — reduces delay from ~3 mins to ~20 seconds."""
+    """Fetch all assets/timeframes in parallel — ~20s instead of ~3 mins."""
     import concurrent.futures
 
     pairs      = [(asset, tf) for asset in ASSETS for tf in TIMEFRAMES]
