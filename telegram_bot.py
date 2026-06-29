@@ -233,17 +233,36 @@ def _trade_keyboard(signal_key: str, amount: float, direction: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def send_signal(signal) -> dict:
-    results  = {}
-    sent_at  = datetime.now(timezone.utc)   # capture ACTUAL send time here
+    results = {}
+    sent_at = datetime.now(timezone.utc)   # capture ACTUAL send time here
 
+    # Build tasks — only for configured channels
+    tasks = []
     if FREE_CHANNEL:
-        results["free"] = _send_message(FREE_CHANNEL, _format_free_message(signal, sent_at))
-
+        tasks.append(("free", FREE_CHANNEL, _format_free_message(signal, sent_at)))
     if VIP_CHANNEL:
-        results["vip"] = _send_message(VIP_CHANNEL, _format_vip_message(signal, sent_at))
+        tasks.append(("vip", VIP_CHANNEL, _format_vip_message(signal, sent_at)))
 
+    # Send free + VIP in parallel so neither waits on the other
+    def _send_task(key, chat_id, text):
+        results[key] = _send_message(chat_id, text)
+
+    threads = [
+        threading.Thread(target=_send_task, args=(key, chat_id, text), daemon=True)
+        for key, chat_id, text in tasks
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=12)   # max 12s — don't block the main scan loop forever
+
+    # Admin prompt fires separately — non-critical, doesn't affect delivery time
     if ADMIN_CHAT_ID:
-        _send_trade_prompt(ADMIN_CHAT_ID, signal)
+        threading.Thread(
+            target=_send_trade_prompt,
+            args=(ADMIN_CHAT_ID, signal),
+            daemon=True
+        ).start()
 
     return results
 
