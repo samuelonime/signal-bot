@@ -314,13 +314,32 @@ async def _stream_asset(asset: str, timeframes: list, on_close, stop_event: asyn
                     }))
                 logger.info(f"📡 Live stream connected: {asset} ({len(req_map)} timeframes)")
 
+                market_closed_count = 0
+
                 while not stop_event.is_set():
                     raw = await asyncio.wait_for(ws.recv(), timeout=40)
                     msg = json.loads(raw)
 
                     if msg.get("error"):
-                        logger.warning(f"Stream error {asset}: {msg['error'].get('message')}")
+                        err_msg = msg['error'].get('message', '')
+                        logger.warning(f"Stream error {asset}: {err_msg}")
+                        # If market is closed, back off instead of hammering reconnects.
+                        # Count errors across all timeframe subscriptions (5 per asset).
+                        # Once all 5 confirm closed, sleep until the market reopens.
+                        if "presently closed" in err_msg.lower() or "market is closed" in err_msg.lower():
+                            market_closed_count += 1
+                            if market_closed_count >= len(req_map):
+                                # All timeframes confirmed closed — sleep 10 minutes
+                                logger.info(
+                                    f"💤 {asset} market closed — pausing stream for 10 minutes "
+                                    f"(will auto-reconnect when market reopens)"
+                                )
+                                await asyncio.sleep(600)
+                                market_closed_count = 0
+                                break  # break inner loop to trigger reconnect
                         continue
+
+                    market_closed_count = 0  # reset on any successful message
 
                     tf = req_map.get(msg.get("req_id"))
                     if not tf:
