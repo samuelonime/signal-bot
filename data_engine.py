@@ -68,6 +68,35 @@ def _clean_dtypes(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _sort_by_timestamp_safe(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Sort rows by timestamp WITHOUT pandas sort_values / iloc reindex.
+    Those trigger a C-level segfault (take_nd / maybe_promote) on
+    Python 3.13 when any column briefly holds object/Decimal data.
+    We extract raw numpy arrays, sort with numpy, and rebuild the
+    DataFrame from explicit-dtype arrays so no object column can exist.
+    """
+    if df.empty or "timestamp" not in df.columns:
+        return df
+
+    ts = np.asarray(df["timestamp"].values, dtype="datetime64[ns]")
+    order = np.argsort(ts, kind="stable")
+
+    def col(name, default=0.0):
+        if name in df.columns:
+            return np.asarray(df[name].values, dtype="float64")[order]
+        return np.full(len(order), default, dtype="float64")
+
+    return pd.DataFrame({
+        "timestamp": ts[order],
+        "open":   col("open"),
+        "high":   col("high"),
+        "low":    col("low"),
+        "close":  col("close"),
+        "volume": col("volume"),
+    })
+
+
 # ---------------------------------------------------------------------------
 # Database helpers
 # ---------------------------------------------------------------------------
@@ -189,8 +218,9 @@ async def _fetch_deriv_async(asset: str, timeframe: str, n_candles: int = 200) -
         df = _clean_dtypes(df)
         df = df.dropna(subset=["timestamp", "open", "high", "low", "close"])
         df = df.drop_duplicates(subset=["timestamp"])
-        idx = df["timestamp"].values.argsort()
-        df  = df.iloc[idx].reset_index(drop=True)
+        # Deriv returns candles already in chronological order; sort the
+        # underlying numpy values and rebuild to avoid pandas iloc reindex.
+        df = _sort_by_timestamp_safe(df)
 
         logger.info(f"✅ Deriv: fetched {len(df)} candles for {asset}/{timeframe} (real-time)")
         return df
@@ -329,8 +359,7 @@ def _fetch_twelve_data(asset: str, timeframe: str) -> pd.DataFrame:
             df = _clean_dtypes(df)
             df = df.dropna(subset=["timestamp", "open", "high", "low", "close"])
             df = df.drop_duplicates(subset=["timestamp"])
-            idx = df["timestamp"].values.argsort()
-            df  = df.iloc[idx].reset_index(drop=True)
+            df = _sort_by_timestamp_safe(df)
             logger.info(f"⚠️ Twelve Data fallback: {len(df)} candles for {asset}/{timeframe}")
             return df
 
@@ -468,32 +497,46 @@ def load_ohlc(asset: str, timeframe: str, limit: int = 300) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
 
-    # Build with explicit float() conversion up front
-    records = [
-        {
-            "timestamp": row[0],
-            "open":   float(row[1]),
-            "high":   float(row[2]),
-            "low":    float(row[3]),
-            "close":  float(row[4]),
-            "volume": float(row[5]) if row[5] is not None else 0.0,
-        }
-        for row in rows
-    ]
+    # SQL already returned rows ORDER BY timestamp DESC (newest first).
+    # Reverse with a plain Python list op so the DataFrame is oldest-first
+    # WITHOUT any pandas sort_values / iloc row-reindex — those are what
+    # segfault on Python 3.13 when columns hold Decimal/object values.
+    rows = list(reversed(rows))
 
-    df = pd.DataFrame(records)
-    df = _clean_dtypes(df)   # force float64 + naive datetime — kills the segfault
+    # Deduplicate timestamps in pure Python (keep first occurrence)
+    seen = set()
+    ts_list, op_list, hi_list, lo_list, cl_list, vol_list = [], [], [], [], [], []
+    for r in rows:
+        ts = r[0]
+        if ts is None or ts in seen:
+            continue
+        seen.add(ts)
+        try:
+            o, h, l, c = float(r[1]), float(r[2]), float(r[3]), float(r[4])
+            v = float(r[5]) if r[5] is not None else 0.0
+        except (TypeError, ValueError):
+            continue
+        ts_list.append(pd.Timestamp(ts))
+        op_list.append(o); hi_list.append(h); lo_list.append(l)
+        cl_list.append(c); vol_list.append(v)
 
-    df = df.dropna(subset=["timestamp", "open", "high", "low", "close"])
-    df = df.drop_duplicates(subset=["timestamp"])
-
-    if len(df) < 5:
-        logger.warning(f"Insufficient data for {asset}/{timeframe}: only {len(df)} rows")
+    if len(ts_list) < 5:
+        logger.warning(f"Insufficient data for {asset}/{timeframe}: only {len(ts_list)} rows")
         return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
 
-    # numpy argsort on clean float64 timestamps — safe, no segfault
-    idx = df["timestamp"].values.argsort()
-    df  = df.iloc[idx].reset_index(drop=True)
+    # Strip timezone uniformly via numpy datetime64 conversion
+    ts_arr = pd.to_datetime(ts_list, utc=True).tz_localize(None)
+
+    # Construct from explicit-dtype numpy arrays — guarantees NO object columns,
+    # so no maybe_promote / take_nd path can ever run.
+    df = pd.DataFrame({
+        "timestamp": np.asarray(ts_arr, dtype="datetime64[ns]"),
+        "open":   np.asarray(op_list,  dtype="float64"),
+        "high":   np.asarray(hi_list,  dtype="float64"),
+        "low":    np.asarray(lo_list,  dtype="float64"),
+        "close":  np.asarray(cl_list,  dtype="float64"),
+        "volume": np.asarray(vol_list, dtype="float64"),
+    })
     return df
 
 
