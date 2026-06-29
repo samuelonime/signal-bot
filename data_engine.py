@@ -101,12 +101,48 @@ def _sort_by_timestamp_safe(df: pd.DataFrame) -> pd.DataFrame:
 # Database helpers
 # ---------------------------------------------------------------------------
 
+_engine = None
+_engine_lock = threading.Lock()
+
+
 def get_engine():
-    db_url = os.getenv(
-        "DATABASE_URL",
-        "postgresql://postgres:password@localhost:5432/signal_bot"
-    )
-    return create_engine(db_url, pool_pre_ping=True)
+    """
+    Singleton engine — reused across the whole process instead of being
+    recreated on every call. Creating a new engine per call (the previous
+    behavior) opens a brand-new connection each time; with 25 sequential
+    store_ohlc() calls during seeding, that's enough to exhaust a managed
+    Postgres provider's connection limit (Neon free tier included), at
+    which point the next connect() just hangs forever with no error and
+    no timeout — which is exactly the silent freeze you saw after the
+    25th pair finished fetching.
+
+    connect_timeout / statement_timeout below ensure that if the DB
+    genuinely can't respond, you get a loud error within seconds instead
+    of an indefinite hang that takes the whole bot down with it.
+    """
+    global _engine
+    if _engine is not None:
+        return _engine
+    with _engine_lock:
+        if _engine is not None:
+            return _engine
+        db_url = os.getenv(
+            "DATABASE_URL",
+            "postgresql://postgres:password@localhost:5432/signal_bot"
+        )
+        _engine = create_engine(
+            db_url,
+            pool_pre_ping=True,
+            pool_size=5,
+            max_overflow=5,
+            pool_timeout=10,      # max wait for a free connection from the pool
+            pool_recycle=300,     # avoid stale connections to managed Postgres
+            connect_args={
+                "connect_timeout": 10,        # TCP/handshake timeout
+                "options": "-c statement_timeout=15000",  # 15s per query
+            },
+        )
+        return _engine
 
 
 def init_db():
