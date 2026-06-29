@@ -79,21 +79,19 @@ def run_live_bot():
     cmd_handler = BotCommandHandler()
     cmd_handler.start()
 
-    # Seed history so indicators have enough candles the moment streaming starts.
-    # Wrapped with a hard timeout: if the DB stalls (e.g. connection pool
-    # exhaustion, slow provider), the bot still starts streaming on schedule
-    # instead of hanging forever before it ever opens a single WebSocket.
-    # Any pairs that didn't get seeded in time get backfilled by the
-    # 5-minute backfill loop further down.
+    # ----------------------------------------------------------------
+    # Startup seed — runs ONCE with the new parallel fetch (~8s).
+    # Hard 90s timeout: if DB/network stalls we still start streaming.
+    # ----------------------------------------------------------------
     logger.info("Seeding initial OHLC history...")
     seed_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     seed_future = seed_pool.submit(refresh_all)
     try:
-        seed_future.result(timeout=60)
+        seed_future.result(timeout=90)
         logger.info("Initial seed complete.")
     except concurrent.futures.TimeoutError:
         logger.warning(
-            "Initial seed did not finish within 60s — starting live streams "
+            "Initial seed did not finish within 90s — starting live streams "
             "anyway. Backfill loop will pick up any missing history."
         )
     except Exception as exc:
@@ -112,8 +110,6 @@ def run_live_bot():
         try:
             handler_start = datetime.now(timezone.utc)
 
-            # The candle's true CLOSE time = open_time + its duration.
-            # (`candle["open_time"]` is when it started, per Deriv's epoch field.)
             close_epoch = candle["open_time"] + TF_MINUTES[tf] * 60
             close_dt    = datetime.fromtimestamp(close_epoch, tz=timezone.utc)
             detect_lag  = (handler_start - close_dt).total_seconds()
@@ -151,8 +147,6 @@ def run_live_bot():
                     f"TOTAL candle-close→Telegram lag={total_lag:.2f}s"
                 )
             else:
-                # Still log lag periodically even with no signal, so you can
-                # see detection latency without waiting for a qualifying signal.
                 if detect_lag > 5:
                     logger.warning(
                         f"  ⚠ {asset}/{tf}: detect_lag={detect_lag:.2f}s "
@@ -167,8 +161,7 @@ def run_live_bot():
         loop.run_in_executor(worker_pool, _handle_candle_close, asset, tf, candle)
 
     # ----------------------------------------------------------------
-    # Lightweight ticker thread for midnight reset + daily/weekly reports.
-    # Independent of the streaming engine — runs every 60s.
+    # Scheduler — midnight reset + daily/weekly reports (every 60s tick)
     # ----------------------------------------------------------------
     _stop_event = threading.Event()
     state = {
@@ -217,17 +210,34 @@ def run_live_bot():
     threading.Thread(target=_scheduler_loop, name="Scheduler", daemon=True).start()
 
     # ----------------------------------------------------------------
-    # Backfill safety net — re-runs the old full refresh every 5 minutes
-    # in the background, purely to patch any gaps from a dropped stream
-    # (it no longer sits on the critical path for sending signals).
+    # Backfill safety net — runs every 30 MINUTES (not every 5 minutes).
+    #
+    # WHY CHANGED:
+    # - Old interval: 300s (5 min). Old fetch time: ~320s sequential.
+    #   Result: backfill was running back-to-back non-stop, consuming
+    #   all DB connections and hammering Deriv WS constantly.
+    # - New interval: 1800s (30 min). New fetch time: ~8s parallel.
+    #   Result: backfill is a rare, fast gap-repair — not a hot loop.
+    #
+    # The live streams (run_streaming_engine) keep data fresh in real
+    # time. This backfill only exists to recover from a dropped stream
+    # or a Railway container restart. 30 minutes is more than enough.
     # ----------------------------------------------------------------
+    _last_backfill = {"time": datetime.now(timezone.utc)}
+
     def _backfill_loop():
         while not _stop_event.is_set():
-            _stop_event.wait(timeout=300)
+            # Sleep 30 minutes between backfills
+            _stop_event.wait(timeout=1800)
             if _stop_event.is_set():
                 break
             try:
+                logger.info("Backfill: running scheduled gap-repair refresh...")
+                t0 = time.time()
                 refresh_all()
+                elapsed = time.time() - t0
+                _last_backfill["time"] = datetime.now(timezone.utc)
+                logger.info(f"Backfill: complete in {elapsed:.1f}s")
             except Exception as exc:
                 logger.error(f"Backfill refresh failed: {exc}")
 
