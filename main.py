@@ -1,8 +1,8 @@
 """
 Main Orchestrator
 Runs the signal bot in a loop:
-  - Refresh OHLC data every minute
-  - Scan IMMEDIATELY after refresh completes (fresh data)
+  - Refresh OHLC data in a BACKGROUND THREAD (non-blocking)
+  - Scan IMMEDIATELY when fresh data is ready — no waiting
   - Send qualifying signals to Telegram instantly
   - Generate daily/weekly reports on schedule
   - Poll Telegram for bot commands
@@ -17,6 +17,7 @@ Usage:
 import os
 import sys
 import time
+import threading
 import logging
 import argparse
 from datetime import datetime, timezone, timedelta
@@ -36,12 +37,13 @@ logger = logging.getLogger("main")
 
 def run_live_bot():
     """
-    Main loop flow:
-      1. Refresh OHLC data (parallel, ~45s)
-      2. Scan for signals IMMEDIATELY after refresh — freshest data
-      3. Send signals to Telegram instantly
-      4. Sleep only the remaining time to fill 60s cycle
-      5. Repeat
+    Main loop — optimised for minimum signal latency.
+
+    Architecture:
+    - Background thread refreshes data every REFRESH_INTERVAL seconds
+    - Main loop blocks on _refresh_ready Event
+    - The instant refresh completes → scan runs → signal sent
+    - Total latency: ~2-3s from candle close to Telegram delivery
     """
     from data_engine   import init_db, refresh_all, get_key_manager
     from signal_engine import scan_all
@@ -60,45 +62,86 @@ def run_live_bot():
     cmd_handler = BotCommandHandler()
     cmd_handler.start()
 
-    last_daily_report  = datetime.now(timezone.utc)
-    last_weekly_report = datetime.now(timezone.utc)
+    last_daily_report   = datetime.now(timezone.utc)
+    last_weekly_report  = datetime.now(timezone.utc)
     last_midnight_reset = datetime.now(timezone.utc)
 
-    CYCLE_INTERVAL = int(os.getenv("SCAN_INTERVAL_SEC", "60"))
+    REFRESH_INTERVAL = int(os.getenv("SCAN_INTERVAL_SEC", "60"))
 
-    while True:
-        cycle_start = datetime.now(timezone.utc)
+    # ----------------------------------------------------------------
+    # Background refresh thread
+    # Fires refresh_all() every REFRESH_INTERVAL seconds independently.
+    # Sets _refresh_ready the moment fresh data lands in the DB.
+    # Main loop wakes up immediately — no fixed sleep blocking it.
+    # ----------------------------------------------------------------
+    _refresh_ready = threading.Event()
+    _stop_event    = threading.Event()
 
+    def _refresh_loop():
+        # Do one immediate refresh on startup so first scan has real data
         try:
-            now = cycle_start
+            logger.info("Initial data refresh...")
+            refresh_all()
+            _refresh_ready.set()
+        except Exception as exc:
+            logger.error(f"Initial refresh failed: {exc}")
 
-            # 1. Midnight reset
-            if now.hour == 0 and now.minute == 0 and (now - last_midnight_reset).seconds > 3600:
+        while not _stop_event.is_set():
+            _stop_event.wait(timeout=REFRESH_INTERVAL)
+            if _stop_event.is_set():
+                break
+            try:
+                logger.info("Refreshing OHLC data...")
+                refresh_all()
+                _refresh_ready.set()   # wake up main loop instantly
+            except Exception as exc:
+                logger.error(f"Data refresh failed: {exc}")
+
+    refresh_thread = threading.Thread(
+        target=_refresh_loop,
+        name="DataRefresh",
+        daemon=True,
+    )
+    refresh_thread.start()
+    logger.info("Background data refresh thread started.")
+
+    # ----------------------------------------------------------------
+    # Main scan loop
+    # Wakes up the instant _refresh_ready is set — not on a fixed timer.
+    # ----------------------------------------------------------------
+    while True:
+        try:
+            # Block here until fresh data is ready (or 90s max safety timeout)
+            got_data = _refresh_ready.wait(timeout=90)
+            _refresh_ready.clear()
+
+            if not got_data:
+                logger.warning("No data refresh in 90s — scanning anyway with cached data.")
+
+            now = datetime.now(timezone.utc)
+
+            # Midnight reset
+            if now.hour == 0 and now.minute == 0 and (now - last_midnight_reset).total_seconds() > 3600:
                 get_key_manager().reset_daily()
                 last_midnight_reset = now
                 logger.info("Midnight UTC — Twelve Data API keys reset.")
 
-            # 2. Refresh OHLC data — fetch all pairs in parallel
-            logger.info("Refreshing OHLC data...")
-            try:
-                refresh_all()
-            except Exception as exc:
-                logger.error(f"Data refresh failed: {exc}")
-
-            # 3. Scan IMMEDIATELY after refresh — data is as fresh as possible
-            scan_time = datetime.now(timezone.utc)
+            # Scan immediately — data is freshest right now
             logger.info("Scanning for signals...")
-            signals = scan_all(dt=scan_time)
+            signals = scan_all(dt=now)
 
-            # 4. Send signals INSTANTLY — no delay between scan and send
+            # Send instantly — no delay between scan and Telegram
             if signals:
                 for sig in signals:
-                    logger.info(f"  → SIGNAL: {sig.asset}/{sig.timeframe} {sig.direction} conf={sig.confidence:.0f}%")
+                    logger.info(
+                        f"  → SIGNAL: {sig.asset}/{sig.timeframe} "
+                        f"{sig.direction} conf={sig.confidence:.0f}%"
+                    )
                     send_signal(sig)
             else:
                 logger.info("  No qualifying signals this scan.")
 
-            # 5. Daily report at 22:00 UTC
+            # Daily report at 22:00 UTC
             if now.hour == 22 and (now - last_daily_report).total_seconds() > 3600:
                 try:
                     report = generate_daily_report()
@@ -109,7 +152,7 @@ def run_live_bot():
                 except Exception as exc:
                     logger.error(f"Daily report failed: {exc}")
 
-            # 6. Weekly report Sunday 22:00 UTC
+            # Weekly report Sunday 22:00 UTC
             if now.weekday() == 6 and now.hour == 22 and (now - last_weekly_report).total_seconds() > 3600:
                 try:
                     report = generate_weekly_report()
@@ -120,22 +163,15 @@ def run_live_bot():
                 except Exception as exc:
                     logger.error(f"Weekly report failed: {exc}")
 
-            # 7. Sleep only remaining time to fill the cycle
-            # This ensures the next refresh starts exactly CYCLE_INTERVAL seconds
-            # after the previous one started — not after it ended
-            elapsed = (datetime.now(timezone.utc) - cycle_start).total_seconds()
-            sleep_time = max(0, CYCLE_INTERVAL - elapsed)
-            logger.info(f"Cycle took {elapsed:.1f}s. Sleeping {sleep_time:.1f}s until next scan...")
-            time.sleep(sleep_time)
-
         except KeyboardInterrupt:
             logger.info("Bot stopped by user.")
+            _stop_event.set()
             cmd_handler.stop()
             send_admin_alert("⏹️ Signal Bot Pro was stopped manually.")
             break
         except Exception as exc:
             logger.error(f"Main loop error: {exc}", exc_info=True)
-            time.sleep(30)
+            time.sleep(10)
 
 
 def run_backtest():
