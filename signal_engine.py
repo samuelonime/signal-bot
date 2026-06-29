@@ -147,19 +147,16 @@ def generate_signal(
         logger.info(f"⛔ {tag}: daily cap reached ({MAX_DAILY_SIGNALS})")
         return None
 
-    # --- Load data
-    if df is None or len(df) < 50:
-        try:
-            df = load_ohlc(asset, timeframe, limit=300)
-            if len(df) < 50:
-                df = fetch_ohlc(asset, timeframe, n_candles=300)
-                store_ohlc(asset, timeframe, df)
-        except Exception as exc:
-            logger.warning(f"⛔ {tag}: data fetch failed — {exc}")
-            return None
+    # --- Load data from DB
+    try:
+        df = load_ohlc(asset, timeframe, limit=300)
+    except Exception as exc:
+        logger.warning(f"⛔ {tag}: data load failed — {exc}")
+        return None
 
-    if len(df) < 50:
-        logger.info(f"⛔ {tag}: insufficient data ({len(df)} candles)")
+    # Skip if not enough data — prevents segfault on market open
+    if df is None or len(df) < 50:
+        logger.info(f"⏭️ {tag}: skipping — only {len(df) if df is not None else 0} candles (market just opened)")
         return None
 
     entry_price = float(df["close"].iloc[-1])
@@ -411,7 +408,7 @@ def _build_reasons(direction, struct, ind, pa, ai, dt) -> List[str]:
         f"(EMA 50 {ema_symbol} EMA 200, strength={struct.trend_strength:.0%})"
     )
 
-    # 2. Support / Resistance — both directions
+    # 2. Support / Resistance
     if struct.at_support:
         if is_call:
             reasons.append(f"Price bouncing off key support ({struct.nearest_support:.5f}) — bullish reversal zone")
@@ -435,7 +432,7 @@ def _build_reasons(direction, struct, ind, pa, ai, dt) -> List[str]:
     if struct.breakout:
         reasons.append(f"Structural breakout: {struct.breakout.replace('_', ' ').title()}")
 
-    # 5. Price action pattern — both directions
+    # 5. Price action pattern
     if pa.dominant_pattern:
         reasons.append(f"{pa.dominant_pattern.name} — {pa.dominant_pattern.description}")
     if is_call and pa.bullish_bias > 0.5:
@@ -443,7 +440,7 @@ def _build_reasons(direction, struct, ind, pa, ai, dt) -> List[str]:
     if is_put and pa.bearish_bias > 0.5:
         reasons.append(f"Bearish candle bias confirmed (score={pa.bearish_bias:.2f})")
 
-    # 6. RSI — both directions
+    # 6. RSI
     if ind.rsi_zone == "oversold":
         reasons.append(f"RSI({ind.rsi:.1f}) in oversold zone — {'bullish reversal likely' if is_call else 'extreme weakness, continuation risk'}")
     elif ind.rsi_zone == "overbought":
@@ -455,7 +452,7 @@ def _build_reasons(direction, struct, ind, pa, ai, dt) -> List[str]:
     else:
         reasons.append(f"RSI({ind.rsi:.1f}) neutral — direction confirmed by structure and price action")
 
-    # 7. MACD — both directions
+    # 7. MACD
     if ind.macd_cross == "bullish":
         reasons.append(f"MACD bullish crossover confirmed — {'momentum aligns with CALL' if is_call else 'crossover conflict, structure dominant'}")
     elif ind.macd_cross == "bearish":
