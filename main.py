@@ -37,141 +37,202 @@ logger = logging.getLogger("main")
 
 def run_live_bot():
     """
-    Main loop — optimised for minimum signal latency.
+    Main loop — event-driven, not polling.
 
     Architecture:
-    - Background thread refreshes data every REFRESH_INTERVAL seconds
-    - Main loop blocks on _refresh_ready Event
-    - The instant refresh completes → scan runs → signal sent
-    - Total latency: ~2-3s from candle close to Telegram delivery
+    - One persistent Deriv WebSocket per asset, subscribed live to every
+      timeframe at once (data_engine.run_streaming_engine).
+    - The instant a candle closes on ANY timeframe, the asyncio stream
+      fires `_on_candle_close` immediately — no waiting for a shared
+      refresh timer.
+    - Candle storage + signal scan + Telegram send for that one
+      asset/timeframe run in a worker thread so they never block the
+      WebSocket event loop (which is juggling 5 live connections).
+    - Reports / midnight reset run on their own lightweight ticker thread,
+      independent of the streaming loop.
+
+    Result: total latency from real candle close to Telegram delivery is
+    bounded by network + processing time only — typically 2-5 seconds,
+    for every timeframe, every time.
     """
-    from data_engine   import init_db, refresh_all, get_key_manager
-    from signal_engine import scan_all
+    import asyncio
+    import concurrent.futures
+    import pandas as pd
+
+    from data_engine   import (
+        init_db, refresh_all, get_key_manager, store_ohlc,
+        run_streaming_engine, ASSETS, TIMEFRAMES, TF_MINUTES,
+    )
+    from signal_engine import generate_signal
     from telegram_bot  import send_signal, send_admin_alert, BotCommandHandler
     from performance_tracker import generate_daily_report, generate_weekly_report
 
     logger.info("=" * 60)
-    logger.info("  Signal Bot Pro — Starting")
+    logger.info("  Signal Bot Pro — Starting (real-time streaming mode)")
     logger.info("=" * 60)
 
     init_db()
     from user_manager import init_user_tables
     init_user_tables()
-    send_admin_alert("🚀 Signal Bot Pro is now online and scanning markets.")
+    send_admin_alert("🚀 Signal Bot Pro is now online and streaming markets live.")
 
     cmd_handler = BotCommandHandler()
     cmd_handler.start()
 
-    last_daily_report   = datetime.now(timezone.utc)
-    last_weekly_report  = datetime.now(timezone.utc)
-    last_midnight_reset = datetime.now(timezone.utc)
+    # Seed history so indicators have enough candles the moment streaming starts
+    logger.info("Seeding initial OHLC history...")
+    try:
+        refresh_all()
+    except Exception as exc:
+        logger.error(f"Initial seed refresh failed: {exc}")
 
-    REFRESH_INTERVAL = int(os.getenv("SCAN_INTERVAL_SEC", "60"))
+    worker_pool = concurrent.futures.ThreadPoolExecutor(
+        max_workers=10, thread_name_prefix="signal-worker"
+    )
 
     # ----------------------------------------------------------------
-    # Background refresh thread
-    # Fires refresh_all() every REFRESH_INTERVAL seconds independently.
-    # Sets _refresh_ready the moment fresh data lands in the DB.
-    # Main loop wakes up immediately — no fixed sleep blocking it.
+    # Fires the instant a candle closes for one asset/timeframe.
+    # Runs in a worker thread — never blocks the live WS connections.
     # ----------------------------------------------------------------
-    _refresh_ready = threading.Event()
-    _stop_event    = threading.Event()
-
-    def _refresh_loop():
-        # Do one immediate refresh on startup so first scan has real data
+    def _handle_candle_close(asset: str, tf: str, candle: dict):
         try:
-            logger.info("Initial data refresh...")
-            refresh_all()
-            _refresh_ready.set()
-        except Exception as exc:
-            logger.error(f"Initial refresh failed: {exc}")
+            handler_start = datetime.now(timezone.utc)
 
+            # The candle's true CLOSE time = open_time + its duration.
+            # (`candle["open_time"]` is when it started, per Deriv's epoch field.)
+            close_epoch = candle["open_time"] + TF_MINUTES[tf] * 60
+            close_dt    = datetime.fromtimestamp(close_epoch, tz=timezone.utc)
+            detect_lag  = (handler_start - close_dt).total_seconds()
+
+            ts = pd.to_datetime(candle["open_time"], unit="s")
+            df = pd.DataFrame([{
+                "timestamp": ts,
+                "open":  candle["open"],
+                "high":  candle["high"],
+                "low":   candle["low"],
+                "close": candle["close"],
+                "volume": 0.0,
+            }])
+            store_ohlc(asset, tf, df)
+
+            now = datetime.now(timezone.utc)
+            sig = generate_signal(asset, tf, dt=now)
+
+            if sig:
+                pre_send_lag = (datetime.now(timezone.utc) - close_dt).total_seconds()
+                logger.info(
+                    f"  → SIGNAL: {asset}/{tf} {sig.direction} "
+                    f"conf={sig.confidence:.0f}% | "
+                    f"close={close_dt.strftime('%H:%M:%S')} UTC | "
+                    f"detect_lag={detect_lag:.2f}s pre_send_lag={pre_send_lag:.2f}s"
+                )
+                send_start = datetime.now(timezone.utc)
+                send_signal(sig)
+                send_done   = datetime.now(timezone.utc)
+                total_lag   = (send_done - close_dt).total_seconds()
+                telegram_ms = (send_done - send_start).total_seconds()
+                logger.info(
+                    f"  ✓ DELIVERED: {asset}/{tf} | "
+                    f"telegram_call={telegram_ms:.2f}s | "
+                    f"TOTAL candle-close→Telegram lag={total_lag:.2f}s"
+                )
+            else:
+                # Still log lag periodically even with no signal, so you can
+                # see detection latency without waiting for a qualifying signal.
+                if detect_lag > 5:
+                    logger.warning(
+                        f"  ⚠ {asset}/{tf}: detect_lag={detect_lag:.2f}s "
+                        f"(candle closed {close_dt.strftime('%H:%M:%S')} UTC) — "
+                        f"higher than expected, check stream health"
+                    )
+        except Exception as exc:
+            logger.error(f"Candle-close handler error {asset}/{tf}: {exc}", exc_info=True)
+
+    async def _on_close(asset: str, tf: str, candle: dict):
+        loop = asyncio.get_running_loop()
+        loop.run_in_executor(worker_pool, _handle_candle_close, asset, tf, candle)
+
+    # ----------------------------------------------------------------
+    # Lightweight ticker thread for midnight reset + daily/weekly reports.
+    # Independent of the streaming engine — runs every 60s.
+    # ----------------------------------------------------------------
+    _stop_event = threading.Event()
+    state = {
+        "last_daily_report":   datetime.now(timezone.utc),
+        "last_weekly_report":  datetime.now(timezone.utc),
+        "last_midnight_reset": datetime.now(timezone.utc),
+    }
+
+    def _scheduler_loop():
         while not _stop_event.is_set():
-            _stop_event.wait(timeout=REFRESH_INTERVAL)
+            _stop_event.wait(timeout=60)
             if _stop_event.is_set():
                 break
             try:
-                logger.info("Refreshing OHLC data...")
-                refresh_all()
-                _refresh_ready.set()   # wake up main loop instantly
+                now = datetime.now(timezone.utc)
+
+                if now.hour == 0 and now.minute == 0 and \
+                        (now - state["last_midnight_reset"]).total_seconds() > 3600:
+                    get_key_manager().reset_daily()
+                    state["last_midnight_reset"] = now
+                    logger.info("Midnight UTC — Twelve Data API keys reset.")
+
+                if now.hour == 22 and (now - state["last_daily_report"]).total_seconds() > 3600:
+                    try:
+                        report = generate_daily_report()
+                        from telegram_bot import send_performance_report
+                        send_performance_report(report, "Daily")
+                        state["last_daily_report"] = now
+                        logger.info("Daily report sent.")
+                    except Exception as exc:
+                        logger.error(f"Daily report failed: {exc}")
+
+                if now.weekday() == 6 and now.hour == 22 and \
+                        (now - state["last_weekly_report"]).total_seconds() > 3600:
+                    try:
+                        report = generate_weekly_report()
+                        from telegram_bot import send_performance_report
+                        send_performance_report(report, "Weekly")
+                        state["last_weekly_report"] = now
+                        logger.info("Weekly report sent.")
+                    except Exception as exc:
+                        logger.error(f"Weekly report failed: {exc}")
             except Exception as exc:
-                logger.error(f"Data refresh failed: {exc}")
+                logger.error(f"Scheduler tick error: {exc}", exc_info=True)
 
-    refresh_thread = threading.Thread(
-        target=_refresh_loop,
-        name="DataRefresh",
-        daemon=True,
-    )
-    refresh_thread.start()
-    logger.info("Background data refresh thread started.")
+    threading.Thread(target=_scheduler_loop, name="Scheduler", daemon=True).start()
 
     # ----------------------------------------------------------------
-    # Main scan loop
-    # Wakes up the instant _refresh_ready is set — not on a fixed timer.
+    # Backfill safety net — re-runs the old full refresh every 5 minutes
+    # in the background, purely to patch any gaps from a dropped stream
+    # (it no longer sits on the critical path for sending signals).
     # ----------------------------------------------------------------
-    while True:
-        try:
-            # Block here until fresh data is ready (or 90s max safety timeout)
-            got_data = _refresh_ready.wait(timeout=90)
-            _refresh_ready.clear()
+    def _backfill_loop():
+        while not _stop_event.is_set():
+            _stop_event.wait(timeout=300)
+            if _stop_event.is_set():
+                break
+            try:
+                refresh_all()
+            except Exception as exc:
+                logger.error(f"Backfill refresh failed: {exc}")
 
-            if not got_data:
-                logger.warning("No data refresh in 90s — scanning anyway with cached data.")
+    threading.Thread(target=_backfill_loop, name="Backfill", daemon=True).start()
 
-            now = datetime.now(timezone.utc)
+    logger.info(f"Opening live streams for {len(ASSETS)} assets × {len(TIMEFRAMES)} timeframes...")
 
-            # Midnight reset
-            if now.hour == 0 and now.minute == 0 and (now - last_midnight_reset).total_seconds() > 3600:
-                get_key_manager().reset_daily()
-                last_midnight_reset = now
-                logger.info("Midnight UTC — Twelve Data API keys reset.")
-
-            # Scan immediately — data is freshest right now
-            logger.info("Scanning for signals...")
-            signals = scan_all(dt=now)
-
-            # Send instantly — no delay between scan and Telegram
-            if signals:
-                for sig in signals:
-                    logger.info(
-                        f"  → SIGNAL: {sig.asset}/{sig.timeframe} "
-                        f"{sig.direction} conf={sig.confidence:.0f}%"
-                    )
-                    send_signal(sig)
-            else:
-                logger.info("  No qualifying signals this scan.")
-
-            # Daily report at 22:00 UTC
-            if now.hour == 22 and (now - last_daily_report).total_seconds() > 3600:
-                try:
-                    report = generate_daily_report()
-                    from telegram_bot import send_performance_report
-                    send_performance_report(report, "Daily")
-                    last_daily_report = now
-                    logger.info("Daily report sent.")
-                except Exception as exc:
-                    logger.error(f"Daily report failed: {exc}")
-
-            # Weekly report Sunday 22:00 UTC
-            if now.weekday() == 6 and now.hour == 22 and (now - last_weekly_report).total_seconds() > 3600:
-                try:
-                    report = generate_weekly_report()
-                    from telegram_bot import send_performance_report
-                    send_performance_report(report, "Weekly")
-                    last_weekly_report = now
-                    logger.info("Weekly report sent.")
-                except Exception as exc:
-                    logger.error(f"Weekly report failed: {exc}")
-
-        except KeyboardInterrupt:
-            logger.info("Bot stopped by user.")
-            _stop_event.set()
-            cmd_handler.stop()
-            send_admin_alert("⏹️ Signal Bot Pro was stopped manually.")
-            break
-        except Exception as exc:
-            logger.error(f"Main loop error: {exc}", exc_info=True)
-            time.sleep(10)
+    try:
+        asyncio.run(run_streaming_engine(_on_close))
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user.")
+        _stop_event.set()
+        cmd_handler.stop()
+        send_admin_alert("⏹️ Signal Bot Pro was stopped manually.")
+    except Exception as exc:
+        logger.error(f"Streaming engine crashed: {exc}", exc_info=True)
+        _stop_event.set()
+        cmd_handler.stop()
+        send_admin_alert(f"⚠️ Signal Bot Pro crashed: {exc}")
 
 
 def run_backtest():
