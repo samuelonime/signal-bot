@@ -143,9 +143,13 @@ def _get_signal_timestamp(df: pd.DataFrame, scan_dt: datetime) -> datetime:
 
         candle_dt = candle_ts.to_pydatetime()
 
-        # Only use if candle is recent (within last 5 minutes)
+        # Only use if candle is genuinely fresh. With the streaming engine,
+        # generate_signal() is called within ~1-3s of the real candle close,
+        # so anything older than ~20s means something upstream stalled —
+        # better to fall back to scan_dt (or be rejected by the caller)
+        # than silently ship a signal that's minutes late.
         age_seconds = (scan_dt.replace(tzinfo=None) - candle_dt).total_seconds()
-        if 0 <= age_seconds <= 300:
+        if 0 <= age_seconds <= 20:
             return candle_dt
 
     except Exception:
