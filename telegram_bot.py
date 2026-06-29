@@ -566,7 +566,7 @@ class BotCommandHandler:
                     "🔗 <b>Connect Your Deriv Account</b>\n\n"
                     "Steps:\n"
                     "1. Go to <b>app.deriv.com/account/api-token</b>\n"
-                    "2. Create token with ✅ <b>Trade</b> permission only\n""
+                    "2. Create token with ✅ <b>Trade</b> permission only\n"
                     "3. Send your token:\n\n"
                     "<code>/connect YOUR_TOKEN_HERE</code>"
                 )
