@@ -105,8 +105,8 @@ def get_engine():
         _engine = create_engine(
             db_url,
             pool_pre_ping=True,
-            pool_size=5,
-            max_overflow=5,
+            pool_size=20,
+            max_overflow=15,
             pool_timeout=10,
             pool_recycle=300,
             connect_args={
