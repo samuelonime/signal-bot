@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 import pandas as pd
 
-from data_engine import fetch_ohlc, store_ohlc, load_ohlc, TF_EXPIRY, ASSETS, TIMEFRAMES
+from data_engine import fetch_ohlc, store_ohlc, load_ohlc, TF_EXPIRY, TF_MINUTES, ASSETS, TIMEFRAMES
 from market_structure import analyse_structure, StructureResult
 from indicators import compute_indicators, IndicatorResult
 from price_action import analyse_price_action, PriceActionResult
@@ -200,11 +200,11 @@ def generate_signal(
     if candle_dt is None:
         logger.warning(f"⛔ {tag}: could not parse candle timestamp — rejecting")
         return None
-    if age_seconds is None or age_seconds < 0 or age_seconds > MAX_CANDLE_AGE_SECONDS:
+    max_age = TF_MINUTES[timeframe] * 60 + 20
+    if age_seconds is None or age_seconds < 0 or age_seconds > max_age:
         logger.warning(
             f"⛔ {tag}: STALE candle — last close was {age_seconds:.1f}s ago "
-            f"(max allowed {MAX_CANDLE_AGE_SECONDS}s). Rejecting signal instead "
-            f"of relabeling it as fresh — check DB pool / worker pool contention."
+            f"(max allowed {max_age}s for {timeframe}). Rejecting."
         )
         return None
 
