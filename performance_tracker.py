@@ -119,6 +119,45 @@ def _compute_stats(df: pd.DataFrame) -> dict:
     }
 
 
+def get_hourly_breakdown(start: datetime, end: datetime) -> pd.DataFrame:
+    """
+    Win rate grouped by UTC hour-of-day across the given period.
+    Use this to empirically confirm/adjust ELEVATED_RISK_HOURS_UTC
+    in filter_engine.py instead of guessing.
+    """
+    df = _fetch_signals_for_period(start, end)
+    if df.empty:
+        return pd.DataFrame()
+
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    df["hour_utc"]   = df["timestamp"].dt.hour
+
+    rows = []
+    for hour in sorted(df["hour_utc"].unique()):
+        sub = df[df["hour_utc"] == hour]
+        st  = _compute_stats(sub)
+        rows.append({"hour_utc": int(hour), **st})
+
+    return pd.DataFrame(rows).sort_values("hour_utc").reset_index(drop=True)
+
+
+def format_hourly_breakdown(start: datetime, end: datetime) -> str:
+    df = get_hourly_breakdown(start, end)
+    if df.empty:
+        return "No completed signals in this period."
+
+    lines = ["  *By Hour (UTC):*"]
+    for _, row in df.iterrows():
+        wat_hour = int(row["hour_utc"] + 1) % 24  # WAT = UTC+1
+        lines.append(
+            f"    {int(row['hour_utc']):02d}:00 UTC "
+            f"({wat_hour:02d}:00 WAT) — "
+            f"{int(row['wins'])}W/{int(row['losses'])}L "
+            f"({row['win_rate']:.1f}%, n={int(row['total'])})"
+        )
+    return "\n".join(lines)
+
+
 def generate_daily_report(target_date: Optional[date] = None) -> str:
     target = target_date or datetime.utcnow().date()
     start  = datetime.combine(target, datetime.min.time())
@@ -155,6 +194,9 @@ def generate_daily_report(target_date: Optional[date] = None) -> str:
             sub = df[df["timeframe"] == tf]
             st  = _compute_stats(sub)
             lines.append(f"    {tf}: {st['wins']}W/{st['losses']}L  ({st['win_rate']:.1f}%)")
+
+        lines.append("")
+        lines.append(format_hourly_breakdown(start, end))
 
     lines.append("")
     lines.append("⚠️ _Trading involves significant risk. Results vary._")
@@ -197,6 +239,9 @@ def generate_weekly_report(week_offset: int = 0) -> str:
             sub = df[df["date"] == d]
             st  = _compute_stats(sub)
             lines.append(f"    {d}: {st['wins']}W/{st['losses']}L  ({st['win_rate']:.1f}%)")
+
+        lines.append("")
+        lines.append(format_hourly_breakdown(start, end))
 
     lines.append("")
     lines.append("⚠️ _Trading involves significant risk._")
