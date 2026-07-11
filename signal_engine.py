@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 import pandas as pd
 
-from data_engine import fetch_ohlc, store_ohlc, load_ohlc, TF_EXPIRY, ASSETS, TIMEFRAMES
+from data_engine import fetch_ohlc, store_ohlc, load_ohlc, TF_EXPIRY, TF_MINUTES, ASSETS, TIMEFRAMES
 from market_structure import analyse_structure, StructureResult
 from indicators import compute_indicators, IndicatorResult
 from price_action import analyse_price_action, PriceActionResult
@@ -128,29 +128,45 @@ def _mark_emitted(asset: str, timeframe: str, direction: str, dt: datetime):
 # Candle timestamp helper
 # ---------------------------------------------------------------------------
 
-def _get_signal_timestamp(df: pd.DataFrame, scan_dt: datetime) -> datetime:
+def _get_signal_timestamp(df: pd.DataFrame, scan_dt: datetime, timeframe: str) -> datetime:
     """
-    Use the last candle's actual close time as the signal timestamp.
-    Falls back to scan_dt if candle timestamp is missing or too stale.
+    Return the signal's timestamp as the actual CLOSE time of the last candle.
+
+    The OHLC store keeps candles keyed by their OPEN time (Deriv's `epoch`
+    convention, used consistently across seed/backfill/stream). So the last
+    row's timestamp is the candle OPEN; its CLOSE is open + one timeframe
+    interval. Earlier this function compared the OPEN time against scan_dt
+    with a fixed 0-20s window — which only ever held on M1, so on M2/M3/M5/M15
+    it always fell back to scan_dt and the card showed the send time as the
+    "candle time". We now compute the real close and validate freshness
+    against a timeframe-scaled window.
+
+    Falls back to scan_dt only if the candle timestamp is missing or the
+    close time is implausibly stale (stream stalled / backfilled gap).
     """
     try:
-        raw_ts = df["timestamp"].iloc[-1]
+        raw_ts    = df["timestamp"].iloc[-1]
         candle_ts = pd.Timestamp(raw_ts)
 
         # Strip timezone if present
         if candle_ts.tzinfo is not None:
             candle_ts = candle_ts.tz_localize(None)
 
-        candle_dt = candle_ts.to_pydatetime()
+        candle_open  = candle_ts.to_pydatetime()
+        interval_min = TF_MINUTES.get(timeframe, 1)
+        candle_close = candle_open + timedelta(minutes=interval_min)
 
-        # Only use if candle is genuinely fresh. With the streaming engine,
-        # generate_signal() is called within ~1-3s of the real candle close,
-        # so anything older than ~20s means something upstream stalled —
-        # better to fall back to scan_dt (or be rejected by the caller)
-        # than silently ship a signal that's minutes late.
-        age_seconds = (scan_dt.replace(tzinfo=None) - candle_dt).total_seconds()
-        if 0 <= age_seconds <= 20:
-            return candle_dt
+        scan_naive = scan_dt.replace(tzinfo=None)
+
+        # Freshness: the just-closed candle's close time should sit at or a
+        # few seconds before scan time. Allow a small negative slack for clock
+        # skew, and a positive staleness budget of ~1.5 candles so a slightly
+        # delayed handler still stamps the correct candle instead of the
+        # wall-clock scan time.
+        age_seconds     = (scan_naive - candle_close).total_seconds()
+        max_stale_secs  = interval_min * 60 * 1.5
+        if -5 <= age_seconds <= max_stale_secs:
+            return candle_close
 
     except Exception:
         pass
@@ -168,7 +184,17 @@ def generate_signal(
     df: Optional[pd.DataFrame] = None,
     dt: Optional[datetime] = None,
     spread_pct: float = 0.0,
+    preview: bool = False,
+    forming_candle: Optional[dict] = None,
 ) -> Optional[Signal]:
+    """
+    preview=True runs the exact same gate stack but WITHOUT side effects
+    (no daily-cap early-return, no duplicate block, no count increment, no
+    'emitted' marking, no EMITTED log). It optionally appends `forming_candle`
+    (the still-open candle) to the loaded history so a heads-up can be produced
+    a few seconds before the candle actually closes. The result is provisional:
+    the last seconds of price action can still change or cancel it.
+    """
 
     dt  = dt or datetime.utcnow()
     tag = f"{asset}/{timeframe}"
@@ -176,8 +202,9 @@ def generate_signal(
     # Timeframe-aware confidence threshold
     tf_threshold = get_confidence_threshold(timeframe)
 
-    # --- Daily cap
-    if _get_count(asset, dt) >= MAX_DAILY_SIGNALS:
+    # --- Daily cap (skipped in preview: a heads-up shouldn't be suppressed by
+    #     the cap, and preview never increments the count anyway)
+    if not preview and _get_count(asset, dt) >= MAX_DAILY_SIGNALS:
         logger.info(f"⛔ {tag}: daily cap reached ({MAX_DAILY_SIGNALS})")
         return None
 
@@ -192,6 +219,29 @@ def generate_signal(
     if df is None or len(df) < 50:
         logger.info(f"⏭️ {tag}: skipping — only {len(df) if df is not None else 0} candles (market just opened)")
         return None
+
+    # In preview mode, append the still-forming candle so the gates evaluate the
+    # in-progress bar. If a bar with the same/last open_time is already the last
+    # row, replace it; otherwise append. This does NOT persist to the DB.
+    if preview and forming_candle is not None:
+        try:
+            f_ts = pd.Timestamp(pd.to_datetime(int(forming_candle["open_time"]), unit="s"))
+            new_row = {
+                "timestamp": f_ts,
+                "open":   float(forming_candle["open"]),
+                "high":   float(forming_candle["high"]),
+                "low":    float(forming_candle["low"]),
+                "close":  float(forming_candle["close"]),
+                "volume": 0.0,
+            }
+            last_ts = pd.Timestamp(df["timestamp"].iloc[-1])
+            if last_ts == f_ts:
+                for k, v in new_row.items():
+                    df.iloc[-1, df.columns.get_loc(k)] = v
+            elif f_ts > last_ts:
+                df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+        except Exception as exc:
+            logger.warning(f"⛔ {tag}: preview forming-candle merge failed — {exc}")
 
     entry_price = float(df["close"].iloc[-1])
 
@@ -265,8 +315,9 @@ def generate_signal(
         )
         return None
 
-    # ---- Gate 7: Duplicate check ----
-    if _is_duplicate(asset, timeframe, direction, dt):
+    # ---- Gate 7: Duplicate check ---- (skipped in preview — a heads-up should
+    # still fire even if a same-direction signal was recently sent)
+    if not preview and _is_duplicate(asset, timeframe, direction, dt):
         return None
 
     # ---- Gate 8: AI confidence ----
@@ -320,7 +371,7 @@ def generate_signal(
     # ---- All gates passed ----
 
     # Get signal timestamp from candle close time
-    signal_ts = _get_signal_timestamp(df, dt)
+    signal_ts = _get_signal_timestamp(df, dt, timeframe)
 
     reasons = _build_reasons(direction, struct, ind, pa, ai_score, signal_ts)
     expiry  = TF_EXPIRY[timeframe]
@@ -341,6 +392,10 @@ def generate_signal(
         prob_down=ai_score.prob_down,
         model_mode=ai_score.model_mode,
     )
+
+    if preview:
+        # Provisional heads-up — no side effects, no EMITTED log.
+        return signal
 
     _increment_count(asset, dt)
     _mark_emitted(asset, timeframe, direction, dt)
